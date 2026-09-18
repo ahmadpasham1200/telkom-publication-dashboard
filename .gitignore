@@ -1,0 +1,27 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (hasil scraping mentah jangan masuk repo)
+data/
+*.json
+!docs/**/*.json
+
+# Docker
+docker/data/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

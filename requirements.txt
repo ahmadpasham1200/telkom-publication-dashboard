@@ -1,0 +1,8 @@
+scholarly
+pandas
+pandera
+SQLAlchemy
+psycopg[binary]
+prefect
+pytest
+python-dotenv
