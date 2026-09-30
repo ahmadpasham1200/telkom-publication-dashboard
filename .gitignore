@@ -18,6 +18,10 @@ data/
 *.json
 !docs/**/*.json
 
+# Eksperimen: hanya file hasil perbandingan yang diabaikan.
+# Kode eksperimen (metode_*.py) dan README.md tetap ikut di-commit.
+eksperimen/**/hasil_*.json
+
 # Docker
 docker/data/
 
