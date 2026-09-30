@@ -20,7 +20,7 @@ Tahap awal setup — struktur repo, database, dan scraping module.
 - **Testing**: pytest
 
 ## Struktur Folder
-
+```
 telkom-publication-dashboard/
 ├── docs/               # dokumentasi (arsitektur, requirements, data dictionary, ADR)
 ├── src/
@@ -32,7 +32,7 @@ telkom-publication-dashboard/
 ├── tests/
 ├── sql/                # ddl, staging, core, mart
 └── docker/
-
+```
 ## Setup (development)
 
 1. Copy `.env.example` menjadi `.env`, isi kredensial database.
