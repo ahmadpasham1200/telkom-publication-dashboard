@@ -53,6 +53,7 @@ jam pengambilan data itu milik file envelope / pemanggil, bukan
 hasil transformasi.
 """
 
+import collections
 import re
 
 # ------------------------------------------------------------
@@ -142,6 +143,186 @@ def _pecah_penulis(nilai):
         return []
     nama = [bagian.strip() for bagian in teks.split(",")]
     return [n for n in nama if n and set(n) != {"."}]
+
+
+# ============================================================
+# PARSER KOLOM `extra` (volume / number / pages)
+# ============================================================
+#
+# Kolom `extra` dari Scholar menggabungkan volume, nomor issue, dan
+# range halaman dalam SATU string bebas ("3(2), 45-60"). Core hanya
+# punya dua kolom untuk isi itu (volume, pages - lihat
+# sql/ddl/02_create_core_tables.sql), jadi parser di bawah memecah
+# yang bisa dipahami dengan yakin dan MENOLAK sisanya. Menebak
+# berarti menulis angka yang salah ke core, dan angka yang salah
+# lebih berbahaya daripada kolom yang masih kosong.
+#
+# Fungsi di sini tetap PURE, sama seperti to_core_rows() di bawah:
+# tidak ada database, tidak ada jaringan, tidak ada berkas.
+
+# Nilai balik parser. Field `alasan` None berarti parse BERHASIL;
+# selain itu isinya alasan penolakan (lihat docstring fungsi).
+HasilParseVolumePages = collections.namedtuple(
+    "HasilParseVolumePages", ["volume", "pages", "alasan"]
+)
+
+# Semua pola di bawah ASCII-only, sama dengan sikap _TAHUN_POLA di
+# atas: digit non-ASCII seperti "٣" (yang lolos str.isdigit())
+    # sengaja tidak diterima, supaya tahun, volume, dan halaman tidak
+    # diam-diam memakai kamus karakter yang berbeda.
+#
+# _HALAMAN_POLA menerima awalan huruf opsional karena Scholar juga
+# menulis label halaman bergaya e-journal ("e12345") dan label nomor
+# artikel ("S1234"), keduanya sah untuk kolom pages VARCHAR(50).
+_HALAMAN_POLA = re.compile(r"^[a-z]{0,2}[0-9]+(?:-[0-9]+)?$", re.IGNORECASE)
+_VOLUME_POLA = re.compile(r"^[0-9]+$")
+_ISSUE_POLA = re.compile(r"^[a-z0-9]+$", re.IGNORECASE)
+_TAHUN_ISSUE_POLA = re.compile(r"^([0-9]+)\s*\(\s*([a-z0-9]+)\s*\)$", re.IGNORECASE)
+
+
+def pecah_extra_volume_pages(extra):
+    """Pecah string `extra` Scholar menjadi pasangan (volume, pages).
+
+    Parameter
+    ---------
+    extra : str | None
+        Isi kolom `extra` satu baris hasil scraping Scholar, apa
+        adanya: bisa None, string kosong, atau teks bebas.
+
+    Mengembalikan
+    --------------
+    HasilParseVolumePages, yaitu namedtuple dengan tiga field:
+    `volume`, `pages`, `alasan`.
+
+    POLA YANG DITERIMA (hanya tiga)
+    -------------------------------
+        1. "VOL(ISSUE), PAGES" -> volume, pages     ("3(2), 45-60")
+        2. "VOL, PAGES"        -> volume, pages     ("15, 234-245")
+        3. "PAGES"             -> None, pages       ("45-60")
+
+    Pemisah pada pola 1 dan 2 boleh koma ATAU titik koma, dan jumlah
+    pemisahnya harus TEPAT SATU. Dua pemisah atau lebih ditolak
+    tanpa ditebak: "3(2), 45-60, 2019" berisi tiga bagian, dan
+    menebak mana yang mana akan menulis angka yang salah.
+
+    Nomor issue pada pola 1 SENGAJA DILEMAH: core tidak punya kolom
+    issue (kolom publikasi hanya volume dan pages), jadi nilainya
+    dibuang, bukan disimpan di tempat lain. Pola ini tetap diterima
+    karena pada pola ini volume dan halaman sudah jelas benar.
+
+    KONTRAK YANG PALING PENTING
+    --------------------------
+    Kalau tidak bisa diurai dengan aman, KEDUA field (volume dan
+    pages) bernilai None. Parser ini tidak pernah menebak dan tidak
+    pernah mengisi sebagian: volume tanpa pages tetap tebakan, dan
+    tebakan di kedua kolom VARCHAR itu akan dibaca downstream
+    seolah-olah itu data sumber.
+
+    `alasan` != None berarti:
+      - "EXTRA_KOSONG"       -> Scholar memang tidak memberi apa pun.
+        INI BUKAN kegagalan parse, dan sengaja dipisahkan dari
+        POLA_TIDAK_DIKENAL. Mencampur keduanya akan membuat
+        persentase kegagalan tampak lebih besar daripada kenyataan,
+        padahalnya cuma "Scholar tidak punya data di sana".
+      - "POLA_TIDAK_DIKENAL" -> ada teksnya, tapi polanya belum
+        dikenal. Ini yang dilaporkan sebagai pola terlewat.
+
+    YANG SENGAJA TIDAK DITERIMA
+    ---------------------------
+    Semua berikut tercatat sebagai pola yang terlewat supaya parser
+    bisa diperluas nanti - bukan supaya ditulis diam-diam ke core:
+
+    - "III, 45-60"          volume angka Romawi; belum ada cara
+                             membedakannya dari nomor issue secara
+                             andal, dan lebih baik kosong daripada
+                             salah.
+    - "Vol. 3, 45-60"       prefiks prosa ("Vol.", "No.", "pp.").
+    - "3(Suppl 1), 45-60"   token issue yang mengandung spasi.
+    - "3(2)"                ada volume tapi tidak ada halaman; isi
+                             sebagian justru lebih berbahaya.
+    - "٣(٢), 45-60"   digit non-ASCII, ditolak dengan sikap yang
+                             sama seperti _TAHUN_POLA.
+    - "45-" / "-60"         range halaman rusak; sudah tertangkap
+                             oleh _HALAMAN_POLA.
+
+    Tipografi yang benar-benar keluar dari Scholar (NBSP, en dash,
+    em dash, minus sign) diratakan lebih dulu sebelum pola dicocokkan
+    supaya teks yang BENAR tidak tercatat sebagai pola tak dikenal.
+    """
+    teks = _rapikan_teks(extra)
+    if teks is None:
+        return HasilParseVolumePages(None, None, "EXTRA_KOSONG")
+
+    # Ratakan tipografi, lalu rapikan lagi karena penggantian spasi
+    # non-ASCII bisa menyisakan spasi ganda.
+    for asal, tujuan in (
+        ("\u00a0", " "),    # no-break space
+        ("\u2007", " "),    # figure space
+        ("\u2009", " "),    # thin space
+        ("\u202f", " "),    # narrow no-break space
+        ("\u2013", "-"),    # en dash
+        ("\u2014", "-"),    # em dash
+        ("\u2212", "-"),    # minus sign
+    ):
+        teks = teks.replace(asal, tujuan)
+    teks = _rapikan_teks(teks)
+    if teks is None:
+        return HasilParseVolumePages(None, None, "EXTRA_KOSONG")
+
+    # Hitung pemisah dulu: pola butuh tepat 0 (halaman saja) atau
+    # tepat 1 pemisah (volume + halaman). Lebih dari satu ditolak
+    # apa adanya - lihat catatan "KONTRAK YANG PALING PENTING".
+    jumlah_pemisah = teks.count(",") + teks.count(";")
+
+    volume = None
+    pages = None
+    berhasil = False
+
+    if jumlah_pemisah == 1:
+        if "," in teks:
+            kiri, kanan = teks.split(",", 1)
+        else:
+            kiri, kanan = teks.split(";", 1)
+        kiri = kiri.strip()
+        kanan = kanan.strip()
+
+        if kiri and kanan:
+            # --- Pola 1: "VOL(ISSUE), PAGES"
+            cocok_issue = _TAHUN_ISSUE_POLA.match(kiri)
+            if cocok_issue:
+                # _ISSUE_POLA dicek ulang secara terpisah meskipun
+                # _TAHUN_ISSUE_POLA sudah membatasi tokennya: kalau
+                # pola itu nanti dilonggarkan, lapis kedua ini yang
+                # masih menahan issue yang aneh. Nilainya sendiri
+                # tetap dibuang (tidak ada kolom issue di core).
+                if _ISSUE_POLA.match(cocok_issue.group(2)) \
+                        and _HALAMAN_POLA.match(kanan):
+                    volume = cocok_issue.group(1)
+                    pages = kanan
+                    berhasil = True
+            elif _VOLUME_POLA.match(kiri) and _HALAMAN_POLA.match(kanan):
+                # --- Pola 2: "VOL, PAGES"
+                volume = kiri
+                pages = kanan
+                berhasil = True
+    elif jumlah_pemisah == 0:
+        # --- Pola 3: hanya range halaman, tanpa volume.
+        if _HALAMAN_POLA.match(teks):
+            pages = teks
+            berhasil = True
+
+    if not berhasil:
+        return HasilParseVolumePages(None, None, "POLA_TIDAK_DIKENAL")
+
+    # Penjaga panjang sesuai DDL: volume dan pages VARCHAR(50).
+    # Pola di atas sudah praktis menolak apa pun yang lebih panjang,
+    # tapi batasnya ditulis eksplisit supaya pelonggaran regex nanti
+    # tidak diam-diam jadi pemotongan string yang sunyi.
+    if (volume is not None and len(volume) > 50) or \
+            (pages is not None and len(pages) > 50):
+        return HasilParseVolumePages(None, None, "POLA_TIDAK_DIKENAL")
+
+    return HasilParseVolumePages(volume, pages, None)
 
 
 # ============================================================

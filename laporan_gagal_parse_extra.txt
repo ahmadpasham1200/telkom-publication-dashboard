@@ -1,0 +1,4 @@
+# Pola `extra` yang tidak dikenali parser.
+# Satu baris per pola unik: <jumlah kemunculan>x <teks>
+# Volume/pages untuk baris-baris ini TIDAK diubah.
+# (tidak ada pola gagal pada run ini)

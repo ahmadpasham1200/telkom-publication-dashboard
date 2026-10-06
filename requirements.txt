@@ -6,3 +6,4 @@ psycopg[binary]
 prefect
 pytest
 python-dotenv
+requests
