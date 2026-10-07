@@ -416,6 +416,76 @@ def _kunci_nama(nama):
     return bersih.casefold()
 
 
+def _bentuk_pendek(pendek, lengkap):
+    """True kalau `pendek` adalah bentuk inisial dari nama `lengkap`.
+
+    Google Scholar menulis pemilik profil dengan NAMA PENDEK di
+    kolom authors tiap baris publikasi ("TAD Kuntjoro"), sementara
+    baris pemilik sendiri dibuat dari NAMA LENGKAP ("Tri Agus Djoko
+    Kuntjoro"). Pencocokan eksak resolver tidak pernah memertemukan
+    keduanya - hasilnya author tiruan tercipta dan baris pemilik
+    kehilangan seluruh relasinya. Fungsi ini dipakai PEMANGGIL
+    (loop publication_authors di load_core_rows) untuk menerjemahkan
+    bentuk pendek ke nama lengkap SEBELUM resolve(); resolver,
+    cache-nya, dan mapper tidak diubah sama sekali (kontraknya ada
+    di transformation/publications.py: kebijakan pencocokan author
+    milik pemanggil).
+
+    Syaratnya ketat - SEMUA harus terpenuhi:
+
+      1. Kedua nama tidak None dan tidak kosong.
+      2. Kata terakhir `pendek` sama (casefold) dengan kata terakhir
+         `lengkap` (= "belakang"). Tanpa ini, inisial apa pun bisa
+         menempel ke orang lain: "TAD Kuntjoro" vs "Abduh Sayid
+         Albana" ditolak di sini.
+      3. Sisa kata `pendek` sebelum belakang, digabung tanpa spasi
+         dan di-casefold, sama dengan inisial (huruf pertama tiap
+         kata) kata `lengkap` sebelum belakang - ATAU sama dengan
+         inisial SELURUH kata `lengkap`. Bentuk kedua menangkap data
+         nyata seperti "MIR Riansyah" untuk "Moch. Iskandar
+         Riansyah" (inisial M+I+R). Kata depan tanpa inisial sama
+         sekali ditolak: "Kuntjoro" vs "Tri Agus Djoko Kuntjoro".
+      4. `pendek` casefold-nya BERBEDA dari `lengkap`. Nama lengkap
+         tidak membutuhkan aturan ini; resolve biasa sudah
+         menemukannya lewat cache.
+      5. `lengkap` terdiri dari minimal dua kata, jadi ada minimal
+         satu inisial. Satu kata tidak bisa dibedakan antara nama
+         pendek dan nama lengkap.
+
+    Yang menentukan benar-salahnya HANYA nama pemilik profil run
+    ini (argumen `lengkap`), bukan author lain. Itu yang mencegah
+    co-author berbeda orang tapi sama belakang ikut tertaut.
+
+    Mengembalikan True/False; tidak pernah melempar untuk input
+    yang buruk (None, kosong, whitespace) - semuanya cukup False.
+    """
+    panjang = _normalisasi_nama(lengkap)
+    pendek_bersih = _normalisasi_nama(pendek)
+    if not panjang or not pendek_bersih:
+        return False
+
+    kata_panjang = panjang.split()
+    kata_pendek = pendek_bersih.split()
+
+    # Syarat 5: minimal satu inisial di sebelum belakang.
+    if len(kata_panjang) < 2:
+        return False
+    # Syarat 4: nama yang sama tidak perlu penerjemahan.
+    if panjang.casefold() == pendek_bersih.casefold():
+        return False
+    # Syarat 2: belakangnya harus sama.
+    if kata_panjang[-1].casefold() != kata_pendek[-1].casefold():
+        return False
+
+    # Syarat 3: awalan pendek == inisial nama lengkap.
+    awalan = "".join(kata_pendek[:-1]).casefold()
+    if not awalan:
+        return False
+    inisial = "".join(kata[0] for kata in kata_panjang[:-1]).casefold()
+    inisial_penuh = inisial + kata_panjang[-1][0].casefold()
+    return awalan in (inisial, inisial_penuh)
+
+
 # ============================================================
 # HELPER: ADAPTASI NILAI UNTUK DRIVER
 # ============================================================
@@ -1154,6 +1224,23 @@ def _stmt_sisip_publication_authors(publication_id, author_id, author_order):
     )
 
 
+def _stmt_hapus_tautan(publication_id, author_id, author_order):
+    """DELETE FROM core.publication_authors untuk tautan spesifik.
+
+    Hanya menghapus baris (publication_id, author_id, author_order)
+    yang SEDANG diproses saat ini. Dipakai saat nama bentuk pendek
+    pemilik terlanjur menempel di author tiruan dari run sebelum fix:
+    tautan lama dibuang, lalu tautan baru disisipkan ke author_id
+    pemilik. Tidak ada DELETE terhadap core.authors, dan tidak ada
+    perubahan ke publikasi lain.
+    """
+    return sa.delete(PUBLICATION_AUTHORS).where(
+        PUBLICATION_AUTHORS.c.publication_id == publication_id,
+        PUBLICATION_AUTHORS.c.author_id == author_id,
+        PUBLICATION_AUTHORS.c.author_order == author_order,
+    )
+
+
 # ------------------------------------------------------------
 # METRICS: APPEND-ONLY, SENGAJA TIDAK DI-UPSERT
 # ------------------------------------------------------------
@@ -1300,6 +1387,11 @@ def _pastikan_judul(judul, indeks, run_id):
 #     dikembalikan, meskipun ON CONFLICT DO NOTHING bisa
 #     diam-diam tidak menulis apa pun (lihat
 #     _stmt_sisip_publication_authors).
+#   - publication_authors_repointed menghitung tautan yang
+#     dialihkan dari author tiruan ke author pemilik (DELETE lama +
+#     INSERT baru untuk publikasi+urutan yang sama). Hanya terjadi
+#     saat nama bentuk pendek pemilik terlanjur menempel di author
+#     lain dari run sebelum fix.
 
 
 def _stats_kosong():
@@ -1314,6 +1406,7 @@ def _stats_kosong():
         "authors_reused": 0,
         "publications_inserted": 0,
         "publication_authors_inserted": 0,
+        "publication_authors_repointed": 0,
         "metrics_inserted": 0,
         "skipped": 0,
     }
@@ -1592,7 +1685,24 @@ def load_core_rows(core, conn=None, run_id=None):
             # Nama yang memuat nama pemilik profil (mis.
             # "Budi Santoso, Budi A. Rahman") akan ketemu pemilik di
             # cache, karena pemilik ditulis lebih dulu.
+            #
+            # Scholar kadang menulis PEMILIK PROFIL dengan nama
+            # pendek ("TAD Kuntjoro") yang tidak pernah cocok eksak
+            # dengan nama lengkap baris pemilik. Siapa yang SEKARANG
+            # memegang nama ini (bisa author tiruan, bisa None) harus
+            # dibaca SEBELUM nama diganti.
+            lama_id = resolver.cari(nama_bersih)
+            if _bentuk_pendek(nama_bersih, pemilik.get("name")):
+                nama_bersih = _normalisasi_nama(pemilik["name"])
             author_id = resolver.resolve(nama_bersih)
+            # Repoint: bila nama tadi terlanjur menempel di author lain
+            # (umumnya tiruan dari run sebelum fix), buang link lama
+            # pada publikasi+urutan ini supaya tidak muncul dua author
+            # pada urutan yang sama.
+            if lama_id is not None and lama_id != author_id:
+                conn.execute(_stmt_hapus_tautan(
+                    publikasi_id[indeks], lama_id, tautan["author_order"]))
+                statistik["publication_authors_repointed"] += 1
             conn.execute(_stmt_sisip_publication_authors(
                 publikasi_id[indeks],
                 author_id,

@@ -18,6 +18,9 @@ data/
 *.json
 !docs/**/*.json
 
+# Artefak batch run (progress per dosen, ditulis tiap iterasi)
+data dosen/progress_batch.csv
+
 # Eksperimen: hanya file hasil perbandingan yang diabaikan.
 # Kode eksperimen (metode_*.py) dan README.md tetap ikut di-commit.
 eksperimen/**/hasil_*.json

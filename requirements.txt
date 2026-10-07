@@ -7,3 +7,4 @@ prefect
 pytest
 python-dotenv
 requests
+openpyxl

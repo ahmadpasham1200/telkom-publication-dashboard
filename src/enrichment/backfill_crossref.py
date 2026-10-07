@@ -123,7 +123,7 @@ CROSSREF_URL = "https://api.crossref.org/works"
 ENV_MAILTO = "CROSSREF_MAILTO"
 
 # Bawaan kalau .env tidak punya CROSSREF_MAILTO.
-MAILTO_DEFAULT = "(jonathan masukan emailmu disini)@gmail.com"
+MAILTO_DEFAULT = "ahmadpasham1200@gmail.com"
 
 # Format yang diminta Crossref: nama tool + versi, lalu kontak di
 # dalam kurung.

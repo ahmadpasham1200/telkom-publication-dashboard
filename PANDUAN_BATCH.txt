@@ -1,0 +1,331 @@
+================================================================================
+PANDUAN PENGGUNAAN BATCH SCRAPE DOSEN
+Project : telkom-publication-dashboard
+File    : src/pipeline/run_batch.py
+Dibuat  : 7 Oktober 2026
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. RINGKAS
+--------------------------------------------------------------------------------
+
+Batch scrape mengambil profil Google Scholar untuk banyak dosen sekaligus dari
+satu file Excel, lalu menyimpan hasilnya ke PostgreSQL.
+
+Satu perintah dasar:
+
+    python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut
+
+--lanjut membuat program MELANJUTKAN dari yang belum selesai, bukan mengulang
+dari awal. Karena itu, perintah yang sama boleh dijalankan berapa kali saja.
+
+
+--------------------------------------------------------------------------------
+2. PRASYARAT
+--------------------------------------------------------------------------------
+
+a) Berada di ROOT project (folder yang berisi file ini).
+
+b) PostgreSQL hidup:
+
+       podman ps --format "{{.Names}}"
+
+   Harus muncul "pubdash_postgres". Kalau mati:
+
+       podman start pubdash_postgres
+
+c) Dependensi Python terpasang:
+
+       pip install -r requirements.txt
+
+d) Browser Playwright tersedia (untuk scraping):
+
+       python -m playwright install chromium
+
+
+--------------------------------------------------------------------------------
+3. FORMAT FILE EXCEL
+--------------------------------------------------------------------------------
+
+Wajib ada kolom bernama "scholar_id" (huruf besar-kecil bebas).
+
+Bentuk yang disarankan (dan dipakai project ini):
+
+    +----+--------------------------+--------------+-------+----------------+
+    | No | NAMA                     | Status Aktif | PRODI | scholar_id     |
+    +----+--------------------------+--------------+-------+----------------+
+    |  1 | Ahmad Fauzi              | P            | S1    | 8kDg_v4AAAAJ   |
+    |  2 | (nama lain)              | T            | S2    | VdPx-dgAAAAJ   |
+    +----+--------------------------+--------------+-------+----------------+
+
+Aturan pembacaan:
+  - Kolom "scholar_id" dicari case-insensitive pada baris pertama (header).
+  - Kalau kolom "scholar_id" tidak ada -> program berhenti dengan exit code 2
+    dan memberi tahu kolom apa saja yang tersedia.
+  - Kolom "no" dan "nama" dicari case-insensitive; kalau tidak ada, program
+    jatuh ke kolom ke-1 dan ke-2.
+  - Sheet yang dipakai: "Sheet1" bila ada, selain itu sheet pertama.
+  - Baris yang SELURUH kosong dilewati (tidak dihitung sebagai dosen).
+  - Baris dengan scholar_id KOSONG -> status DILEWATI (dilewati, dicatat).
+
+Cara mendapatkan scholar_id:
+  Buka profil Google Scholar dosen, lihat bagian ?user= pada URL:
+
+      https://scholar.google.com/citations?user=8kDg_v4AAAAJ&hl=id
+                                     ^^^^^^^^^^^^^^^^^^^^
+      bagian inilah yang dimasukkan ke kolom "scholar_id"
+
+  Format: 12 karakter, diakhiri "AAAAJ", boleh berisi huruf, angka, tanda
+  hubung (-) dan garis bawah (_). Boleh diawali tanda hubung, contoh:
+  "-zWuOpYAAAAJ" itu valid.
+
+
+--------------------------------------------------------------------------------
+4. CARA MENJALANKAN
+--------------------------------------------------------------------------------
+
+4.1. Jalankan semua yang belum selesai (yang paling sering dipakai)
+
+    python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut
+
+    Aman dijalankan berulang. Dosen berstatus terminal (OK, DILEWATI,
+    GAGAL_LOAD, GAGAL_SCRAPE) akan dilewati.
+
+4.2. Mulai dari awal, paksa semua dosen diproses ulang
+
+    python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --ulang
+
+    HATI-HATI: --ulang mengalahkan --lanjut, jadi SEMUA baris ikut diproses
+    (termasuk yang sudah OK). Pakai hanya kalau memang mau mengulang total.
+
+4.3. Mulai dari baris ke-N
+
+    python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --mulai 50
+
+    Angka dihitung dari baris DATA pertama (header tidak dihitung), 1-based.
+
+4.4. Jeda lebih lama antar dosen (disarankan kalau sering diblokir)
+
+    python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut --jeda 12
+
+    Default 8 detik. Naikkan kalau Google Scholar mulai memperlambat.
+
+
+--------------------------------------------------------------------------------
+5. SEMUA FLAG
+--------------------------------------------------------------------------------
+
+    --file FILE       (WAJIB) Path file Excel daftar dosen.
+    --jeda JEDA       Jeda antar dosen dalam detik. Default 8.0.
+    --lanjut          Lewati dosen yang statusnya sudah terminal.
+    --ulang           Paksa ulang semua dosen. Mengalahkan --lanjut.
+    --mulai N         Mulai dari baris data ke-N. Default 1.
+    --progress PATH   Path file progress. Default: data dosen/progress_batch.csv
+    --headed          Tampilkan jendela browser (default: headless/tersembunyi).
+    --batch N         Batas klik "Tampilkan lainnya" di run_pipeline.
+    --diam            Matikan progress scraper (untuk batch selalu menyala).
+    --tampil N        Jumlah baris tabel yang dicetak per dosen. Default 0 (tidak).
+    --url URL         URL koneksi PostgreSQL lengkap (biasanya tidak perlu).
+    --echo-sql        Cetak SQL yang dijalankan (untuk debugging).
+
+PENTING tentang --batch:
+    --batch adalah BATAS KLIK TOMBOL "Tampilkan lainnya" di halaman Google
+    Scholar SATU DOSEN - bukan jumlah dosen yang diproses. Untuk menjumlahkan
+    dosen gunakan --mulai atau biarkan (--lanjut).
+
+
+--------------------------------------------------------------------------------
+6. EXIT CODE
+--------------------------------------------------------------------------------
+
+    0   Semua dosen yang diproses berhasil.
+    1   Ada dosen gagal (GAGAL_LOAD / GAGAL_SCRAPE / GAGAL).
+    2   Gagal membaca daftar (file tidak ada / kolom scholar_id hilang).
+    130 Dihentikan pengguna (Ctrl+C).
+
+Di PowerShell, lihat dengan:
+
+    $LASTEXITCODE
+
+
+--------------------------------------------------------------------------------
+7. STATUS DOSEN
+--------------------------------------------------------------------------------
+
+    OK            Scrape dan load sukses.
+    DILEWATI      scholar_id kosong di Excel.
+    GAGAL_LOAD    Scrape jalan, tapi gagal masuk database.   (exit 1)
+    GAGAL_SCRAPE  Gagal mengambil halaman dari Google.       (exit 2)
+    GAGAL         Error tak terduga yang bukan keduanya.
+
+Yang termasuk TERMINAL (akan dilewati oleh --lanjut):
+
+    OK, DILEWATI, GAGAL_LOAD, GAGAL_SCRAPE
+
+Yang TIDAK terminal:
+
+    GAGAL  -> akan DICoba LAGI pada --lanjut berikutnya.
+
+Artinya: kalau ada dosen berstatus GAGAL, jalankan lagi perintah yang sama
+sampai statusnya berubah jadi salah satu yang terminal.
+
+
+--------------------------------------------------------------------------------
+8. FILE PROGRESS
+--------------------------------------------------------------------------------
+
+Lokasi : data dosen/progress_batch.csv   (sudah masuk .gitignore)
+Kolom  : scholar_id, nama, status, exit_code, waktu
+
+Cara kerja:
+  - Satu baris ditulis setiap kali satu dosen SELESAI diproses.
+  - Baris di-FLUSH langsung ke disk, jadi kalau program mati di tengah jalan
+    (termasuk Ctrl+C atau listrik padam), pekerjaan yang sudah selesai tidak
+    hilang.
+  - Kalau ada baris kembar untuk scholar_id yang sama, yang TERAKHIR yang
+    dipakai.
+  - File bisa berisi delimiter campuran (koma dan titik-koma) dan tetap
+    terbaca dengan benar (lihat bagian 10).
+
+Mengulang satu dosen tertentu:
+  Hapus barisnya dari file progress, lalu jalankan lagi dengan --lanjut.
+
+  Contoh - mengulang tiga dosen yang sudah jalan:
+
+      Buka data dosen\progress_batch.csv di Notepad (bukan Excel!),
+      hapus baris yang diawali:
+          8kDg_v4AAAAJ,...
+          VdPx-dgAAAAJ,...
+          GHtaGbQAAAAJ,...
+
+      lalu:
+          python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut
+
+
+--------------------------------------------------------------------------------
+9. WORKFLOW LENGKAP
+--------------------------------------------------------------------------------
+
+Langkah 1 - pastikan database hidup
+    podman start pubdash_postgres
+
+Langkah 2 - jalankan batch
+    python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut
+
+Langkah 3 - kalau terputus (Ctrl+C / mati / error)
+    Jalankan PERINTAH YANG SAMA. Sisa dosen akan diproses otomatis.
+
+Langkah 4 - lihat hasilnya
+    Import-Csv "data dosen\progress_batch.csv" | Group-Object status
+
+Langkah 5 - ulangi sampai semua terminal
+    Kalau masih ada GAGAL, jalankan lagi perintah langkah 2.
+
+
+--------------------------------------------------------------------------------
+10. MASALAH UMUM
+--------------------------------------------------------------------------------
+
+10.1. "error: argument --id: expected one argument"
+
+    Sudah diperbaiki pada versi ini. Kalau masih muncul, kemungkinan file
+    src/pipeline/run_batch.py belum terbaru. Pastikan tidak ada salinan lama.
+
+10.2. Batch berhenti di tengah jalan tanpa pesan jelas
+
+    Seharusnya tidak terjadi lagi: satu dosen bermasalah kini dicatat GAGAL
+    dan dosen berikutnya tetap diproses. Kalau masih berhenti, catat pesan
+    terakhirnya dan dosen ke berapa.
+
+10.3. --lanjut tidak melewati dosen yang sudah jalan
+
+    Biasanya karena file progress pernah dibuka/di-save di Excel. Lihat
+    bagian 10.4.
+
+10.4. PERINGATAN: JANGAN buka progress_batch.csv di Excel
+
+    Locale Indonesia memakai TITIK-KOMA (;) sebagai pemisah kolom. Begitu
+    file disimpan dari Excel, seluruh baris diubah jadi pemisah titik-koma,
+    dan itu membuat file tercampur (sebagian koma, sebagian titik-koma).
+
+    Untuk MELIHAT isinya, pakai PowerShell:
+
+        Import-Csv "data dosen\progress_batch.csv" | Group-Object status
+        Import-Csv "data dosen\progress_batch.csv" | Where-Object status -eq "GAGAL"
+
+    Kalau terpaksa membuka di Excel: pilih File > Open, set Delimiter = koma
+    pada wizard impor, lalu JANGAN SAVE - cukup lihat saja.
+
+    Kalau file sudah terlanjur tercampur: program tetap bisa membacanya
+    (delimiter dipilih per baris), jadi tidak perlu diperbaiki manual.
+
+10.5. Google Scholar memperlambat / memblokir
+
+    Naikkan jeda:  --jeda 15
+    Jalankan pada jam tidak sibuk.
+
+10.6. Satu dosen gagal terus-menerus
+
+    Cek dulu scholar_id-nya benar atau tidak dengan membuka langsung:
+
+        https://scholar.google.com/citations?user=SCHOLAR_ID
+
+    Kalau halamannya kosong/404, ID-nya salah. Perbaiki di Excel, lalu
+    jalankan lagi dengan --lanjut.
+
+10.7. Publikasi dosen tidak tertaut ke nama profilnya (relasi 0)
+
+    Ini masalah loader, bukan batch. Jalankan ulang dosen tersebut dengan
+    --lanjut setelah barisnya dihapus dari progress - loader akan
+    memindahkan link dari nama tiruan ke nama profil secara otomatis.
+
+
+--------------------------------------------------------------------------------
+11. CONTOH PERINTAH YANG SERING DIPAKAI
+--------------------------------------------------------------------------------
+
+# Jalankan sisa yang belum selesai (paling umum)
+python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut
+
+# Sama, tapi jeda lebih panjang dan mulai dari baris 50
+python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut --jeda 15 --mulai 50
+
+# Lihat browser yang berjalan
+python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut --headed
+
+# Cek status
+Import-Csv "data dosen\progress_batch.csv" | Group-Object status
+
+# Lihat yang gagal
+Import-Csv "data dosen\progress_batch.csv" | Where-Object { $_.status -eq "GAGAL" -or $_.status -eq "GAGAL_LOAD" -or $_.status -eq "GAGAL_SCRAPE" }
+
+# Jalankan test (harus 144 passed)
+python -m pytest tests/ -q
+
+
+--------------------------------------------------------------------------------
+12. CATATAN TEKNIS (untuk yang ingin mengubah kode)
+--------------------------------------------------------------------------------
+
+  - Entry point     : run_batch.main(argv) -> int, lalu sys.exit(main()).
+  - Per dosen       : run_batch membangun argv -> run_pipeline.main(argv_anak).
+  - Argumen diteruskan pakai bentuk --nama=nilai (BUKAN --nama nilai),
+    supaya scholar_id yang diawali tanda "-" tidak dianggap flag oleh argparse.
+  - SystemExit dari run_pipeline DITANGKAP per dosen, supaya satu dosen
+    bermasalah tidak mematikan seluruh batch. SystemExit adalah BaseException,
+    bukan Exception - jadi blok `except Exception` saja TIDAK cukup.
+  - KeyboardInterrupt (kode 130) TETAP menghentikan seluruh batch.
+  - baca_progress memilih delimiter (; atau ,) PER BARIS, bukan per file.
+  - tulis_progress selalu append + flush, delimiter koma.
+
+  File yang TIDAK BOLEH diubah tanpa pembahasan:
+      src/loading/postgres.py, src/transformation/*, src/ingestion/*,
+      src/pipeline/run_pipeline.py, sql/ddl/*
+
+  Test:
+      python -m pytest tests/ -q     # 144 passed
+
+================================================================================
+Akhir panduan.
+================================================================================
