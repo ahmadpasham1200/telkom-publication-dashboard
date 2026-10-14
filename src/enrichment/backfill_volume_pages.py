@@ -2,32 +2,21 @@
 Isi ulang kolom volume / pages di core.publications dari data raw.
 
 ============================================================
-PERINGATAN YANG WAJIB DIBACA SEBELUM MENJALANKAN
+CATATAN SEBELUM MENJALANKAN
 ============================================================
 
-Script ini BAKAL KEHILANGAN work-nya kalau pipeline utama
-dijalankan ulang pada author yang sama.
+Natural key publikasi sekarang (title, publication_year) -
+bukan (title, publication_date) lagi. Script ini harus
+mencocokkan kunci yang SAMA dengan yang dipakai loader, kalau
+tidak UPDATE-nya tidak akan menemukan baris mana pun.
 
-Kenapa: _stmt_sisip_publikasi() di src/loading/postgres.py
-(sekitar baris 1108-1112) menulis ULANG setiap kolom non-kunci dari
-EXCLUDED saat INSERT ... ON CONFLICT DO UPDATE menang - artinya
-"run terakhir menang", applies untuk volume dan pages juga. Padahal
-mapper di to_core_rows() selalu mengeluarkan None untuk kedua kolom
-itu, karena row["extra"] memang tidak dipecah di sana.
-
-Akibatnya:
-
-    pipeline --isi--> core (volume=NULL, pages=NULL)
-    backfill --isi--> core (volume='3',   pages='45-60')   <- kerja kita
-    pipeline --lagi--> core (volume=NULL, pages=NULL)      <- HILANG
-
-Jadi urutan yang benar: pipeline dulu sampai selesai, baru script ini.
-Kalau pipeline dijalankan lagi setelahnya, cukup jalankan script ini
-lagi; tidak ada data yang perlu diperbaiki secara manual.
-
-Keputusan ini sudah disepakati: loader TIDAK diubah. Kalau nanti
-maunya selesai, perbaikannya di sisi loader (mis. pakai COALESCE
-untuk volume dan pages), bukan di file ini.
+Sejak revisi pipeline (rencana 3e), _stmt_sisip_publikasi() di
+src/loading/postgres.py memakai COALESCE(EXCLUDED.kolom,
+kolom_lama) untuk kolom enrichment termasuk volume dan pages,
+jadi nilai yang diisi script ini TIDAK lagi terhapus oleh run
+pipeline berikutnya yang mengirim NULL. Peringatan lama
+"backfill hilang setelah pipeline dijalankan ulang" sudah
+tidak berlaku.
 
 ============================================================
 CARA KERJA
@@ -40,10 +29,10 @@ CARA KERJA
        field `extra`.
     4. Kalau berhasil, UPDATE core.publications berdasarkan natural
        key yang sama dengan yang dipakai loader: (title,
-       publication_date).
+       publication_year).
 
 Kenapa natural key-nya harus PERSIS sama dengan loader: kalau
-normalisasi judul atau tanggal diulang di sini dengan kode sendiri,
+normalisasi judul atau tahun diulang di sini dengan kode sendiri,
 nilainya bisa berbeda sedikit dari yang ditulis loader, UPDATE-nya
 lalu tidak mencocokkan baris mana pun, dan data hilang tanpa error.
 Karena itu file ini IMPOR helper normalisasi yang sama, bukan
@@ -104,14 +93,14 @@ from src.loading.postgres import (  # noqa: E402
 # sengaja private di modul aslinya, tapi menyalin logikanya ke file
 # ini justru berisiko. UPDATE di bawah harus menghasilkan nilai kunci
 # yang byte-identical dengan yang ditulis loader, jadi judul dan
-# tanggal harus melewati _rapikan_teks dan _normalisasi_tahun yang
-# sama. Duplikasi di sini berarti satu jalur bisa diam-diam berbeda
+# tahun harus melewati _rapikan_teks dan _tahun_int yang sama.
+# Duplikasi di sini berarti satu jalur bisa diam-diam berbeda
 # dari jalur lain, dan akibatnya UPDATE tidak cocok tanpa error.
 # Satu-satunya konsekuensinya: kalau helper di publications.py
 # berubah, file ini ikut berubah - dan itu justru yang benar.
 from src.transformation.publications import (  # noqa: E402
-    _normalisasi_tahun,
     _rapikan_teks,
+    _tahun_int,
     pecah_extra_volume_pages,
 )
 
@@ -140,6 +129,9 @@ LOG_DEFAULT = "laporan_gagal_parse_extra.txt"
 FIELD_EXTRA = "extra"
 FIELD_JUDUL = "title"
 FIELD_TAHUN = "year"
+# Tahun terstruktur (INTEGER) yang ditambahkan scraper baru; envelope
+# lama tidak punya kunci ini, jadi fallback ke FIELD_TAHUN.
+FIELD_TAHUN_STRUKTUR = "publication_year"
 
 
 # ============================================================
@@ -177,30 +169,30 @@ def _stmt_perbarui_publikasi():
         UPDATE core.publications
            SET volume = :volume, pages = :pages
          WHERE title = :judul
-           AND publication_date IS NOT DISTINCT FROM CAST(:tanggal AS date)
+           AND publication_year IS NOT DISTINCT FROM :tahun
         RETURNING publications_id
 
     Kenapa IS NOT DISTINCT FROM dan BUKAN `=`:
     batasan uniknya adalah UNIQUE NULLS NOT DISTINCT (title,
-    publication_date) (lihat sql/ddl/03_create_raw_scrape_result.sql),
-    jadi publikasi tanpa tanggal yang sah ikut tercakup: NULL-nya
+    publication_year) (lihat sql/ddl/06_add_core_publication_columns.sql),
+    jadi publikasi tanpa tahun yang sah ikut tercakup: NULL-nya
     harus dicocokkan sebagai NULL. Dengan operator `=` biasa,
     perbandingan dengan NULL menghasilkan NULL - bukan true - sehingga
-    setiap publikasi tanpa tanggal akan dilewati diam-diam dan
+    setiap publikasi tanpa tahun akan dilewati diam-diam dan
     dihitung sebagai "tidak cocok".
 
-    Kenapa tanggalnya di-CAST: kolomnya bertipe DATE, sementara
-    _normalisasi_tahun() mengembalikan string "YYYY-01-01". Kalau
-    `tanggal` None, CAST-nya jadi SQL NULL, dan itu justru yang
-    dipakai IS NOT DISTINCT FROM untuk mencocokkan publication_date
-    yang NULL.
+    `tahun` adalah INTEGER (hasil _tahun_int / publication_year dari
+    envelope), sama persis dengan nilai yang ditulis loader ke kolom
+    publication_year. Kalau `tahun` None, IS NOT DISTINCT FROM
+    mencocokkan publication_year yang NULL - perilaku yang sama
+    dengan NULLS NOT DISTINCT pada constraint.
     """
     return (
         sa.update(PUBLICATIONS)
         .where(
             PUBLICATIONS.c.title == sa.bindparam("judul"),
-            PUBLICATIONS.c.publication_date.is_not_distinct_from(
-                sa.cast(sa.bindparam("tanggal"), sa.Date)
+            PUBLICATIONS.c.publication_year.is_not_distinct_from(
+                sa.bindparam("tahun")
             ),
         )
         .values(
@@ -222,16 +214,14 @@ def _garis(judul):
 
 
 def _peringatan():
-    """Peringatan yang harus muncul sebelum operator menekan commit."""
+    """Catatan yang harus muncul sebelum operator menekan commit."""
     print()
-    print("  !! PERINGATAN !!")
-    print("  Menjalankan run_pipeline.py untuk author yang sama SETELAH")
-    print("  script ini akan mengembalikan volume dan pages ke NULL:")
-    print("  _stmt_sisip_publikasi() menulis ulang setiap kolom non-kunci")
-    print("  dari EXCLUDED, sedangkan mapper selalu mengirim None untuk")
-    print("  volume dan pages. Urutan yang benar: pipeline dulu, lalu")
-    print("  script ini. Kalau pipeline dijalankan lagi, jalankan juga")
-    print("  lagi script ini.")
+    print("  !! CATATAN !!")
+    print("  Natural key yang dicocokkan: (title, publication_year),")
+    print("  sama dengan yang dipakai loader. Sejak revisi pipeline,")
+    print("  _stmt_sisip_publikasi() memakai COALESCE untuk volume dan")
+    print("  pages, jadi nilai yang diisi script ini TIDAK terhapus oleh")
+    print("  run pipeline berikutnya yang mengirim NULL.")
 
 
 def _statistik_kosong():
@@ -303,9 +293,9 @@ def parse_args(argv=None):
             "  python src/enrichment/backfill_volume_pages.py "
             "--log laporan.txt\n"
             "\n"
-            "Ingat: jalankan pipeline sampai selesai DULU, lalu script ini.\n"
-            "Menjalankan pipeline lagi akan mengembalikan volume/pages\n"
-            "ke NULL - lihat peringatan di ringkasan keluaran.\n"
+            "Natural key yang dicocokkan: (title, publication_year).\n"
+            "Sejak revisi pipeline, nilai volume/pages yang diisi di sini\n"
+            "tidak lagi terhapus oleh run pipeline berikutnya.\n"
         ),
     )
     p.add_argument("--dry-run", action="store_true",
@@ -373,7 +363,8 @@ def main(argv=None):
                     continue
 
                 statistik["total_cek"] += 1
-                tanggal = _normalisasi_tahun(item.get(FIELD_TAHUN))
+                tahun = item.get(FIELD_TAHUN_STRUKTUR) or _tahun_int(
+                    item.get(FIELD_TAHUN))
 
                 urai = pecah_extra_volume_pages(item.get(FIELD_EXTRA))
                 if urai.alasan == ALASAN_EXTRA_KOSONG:
@@ -393,7 +384,7 @@ def main(argv=None):
                     stmt_perbarui,
                     {
                         "judul": judul,
-                        "tanggal": tanggal,
+                        "tahun": tahun,
                         "volume": urai.volume,
                         "pages": urai.pages,
                     },
@@ -459,11 +450,11 @@ def main(argv=None):
         print("  !! PERINGATAN KERAS !!")
         print("  {} baris berhasil diurai tapi TIDAK ADA di core dengan".format(
             statistik["tidak_cocok"]))
-        print("  natural key (title, publication_date) yang sama. Data itu")
+        print("  natural key (title, publication_year) yang sama. Data itu")
         print("  hilang tanpa error. Penyebab paling mungkin: normalisasi")
         print("  judul atau tahun berbeda dari yang ditulis loader, atau")
         print("  barisnya belum pernah masuk core. Cek dengan:")
-        print("    SELECT title, publication_date FROM core.publications")
+        print("    SELECT title, publication_year FROM core.publications")
         print("    WHERE title LIKE '%<potongan judul>%';")
 
     if statistik["gagal_pola"]:
@@ -489,8 +480,8 @@ def main(argv=None):
         print("  Ini dry-run: tidak ada perubahan di database.")
     else:
         print()
-        print("  Selesai. Jangan jalankan pipeline untuk author yang sama")
-        print("  tanpa menjalankan ulang script ini.")
+        print("  Selesai. Nilai volume/pages yang diisi di sini bertahan")
+        print("  terhadap run pipeline berikutnya (COALESCE di loader).")
     return 0
 
 

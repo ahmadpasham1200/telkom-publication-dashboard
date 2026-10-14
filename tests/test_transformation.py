@@ -268,3 +268,254 @@ def test_ulang_panggil_hasil_sama(extra):
     """Parser murni: input sama -> output sama, berapa kali pun."""
     assert (pecah_extra_volume_pages(extra)
             == pecah_extra_volume_pages(extra))
+
+
+# ============================================================
+# TEST MAPPER to_core_rows() DAN HELPER-NYA
+# ============================================================
+#
+# Bagian ini ditambahkan di BAWAH tanpa mengubah test di atas.
+# Menguji kontrak mapper: helper kecil (tahun, tanggal, kategori,
+# pecah penulis) dan dua jalur utama to_core_rows (detail vs list).
+# Semua nama privat sengaja diimpor apa adanya karena file test ini
+# memang bagian dari paket yang sama.
+
+from src.transformation.publications import (  # noqa: E402
+    SOURCE,
+    INDEX_NAME,
+    _pecah_penulis,
+    _normalisasi_tanggal_detail,
+    _tahun_int,
+    to_core_rows,
+    turunan_kategori,
+)
+
+
+# ------------------------------------------------------------
+# _tahun_int: ambil tahun 4 digit pertama dari teks bebas
+# ------------------------------------------------------------
+
+@pytest.mark.parametrize("nilai, harapan", [
+    ("2024", 2024),
+    ("2024-2025", 2024),
+    ("in press", None),
+    (None, None),
+    ("", None),
+])
+def test_tahun_int(nilai, harapan):
+    """Tahun diambil sebagai int; teks tanpa tahun -> None."""
+    assert _tahun_int(nilai) == harapan
+
+
+# ------------------------------------------------------------
+# _normalisasi_tanggal_detail: hanya tanggal lengkap YYYY/MM/DD
+# ------------------------------------------------------------
+
+@pytest.mark.parametrize("nilai, harapan", [
+    ("2024/12/31", "2024-12-31"),
+    ("2024/1/5", "2024-01-05"),
+    ("2024", None),
+    ("2024/12", None),
+    ("2024/13/45", None),
+    (None, None),
+    ("", None),
+])
+def test_normalisasi_tanggal_detail(nilai, harapan):
+    """Tanggal parsial/mustahil ditolak; tanggal lengkap -> ISO."""
+    assert _normalisasi_tanggal_detail(nilai) == harapan
+
+
+# ------------------------------------------------------------
+# turunan_kategori: heuristik label venue, bukan data sumber
+# ------------------------------------------------------------
+
+@pytest.mark.parametrize("label, harapan", [
+    ("Jurnal", "journal"),
+    ("jurnal", "journal"),
+    ("Konferensi", "conference"),
+    ("Prosiding", None),
+    (None, None),
+    ("", None),
+])
+def test_turunan_kategori(label, harapan):
+    """Label 'Jurnal'/'Konferensi' dipetakan, sisanya None."""
+    assert turunan_kategori(label) == harapan
+
+
+# ------------------------------------------------------------
+# _pecah_penulis: buang elemen kosong dan elipsis "..."
+# ------------------------------------------------------------
+
+@pytest.mark.parametrize("nilai, harapan", [
+    ("A, B, C", ["A", "B", "C"]),
+    ("A, B, ...", ["A", "B"]),
+    ("A,,B", ["A", "B"]),
+    (None, []),
+    ("", []),
+])
+def test_pecah_penulis(nilai, harapan):
+    """Pemisahan koma menjaga urutan dan membuang elipsis."""
+    assert _pecah_penulis(nilai) == harapan
+
+
+# ------------------------------------------------------------
+# to_core_rows: jalur detail (halaman detail otoritatif)
+# ------------------------------------------------------------
+
+def test_to_core_rows_jalur_detail():
+    """Saat detail_authors terisi, kolom detail yang dipakai."""
+    raw = {
+        "scholar_id": "SCH123",
+        "name": "Budi Santoso",
+        "h_index": 7,
+        "rows": [{
+            "title": "Judul Penelitian",
+            "authors": "B. Santoso, A. Rahman",
+            "venue": "Journal of Testing",
+            "extra": "9(1), 1-10",
+            "citations": 10,
+            "year": "2024",
+            "publication_year": 2024,
+            "detail_authors": "Budi Santoso, Ahmad Rahman, Citra Dewi",
+            "detail_date": "2024/12/31",
+            "detail_venue": "Jurnal Ilmu Komputer",
+            "detail_venue_label": "Jurnal",
+            "detail_volume": "5",
+            "detail_issue": "2",
+            "detail_pages": "10-20",
+            "detail_publisher": "Penerbit Telkom",
+            "detail_description": "Deskripsi singkat",
+            "detail_link": "https://example.com/paper",
+        }],
+    }
+    core = to_core_rows(raw, retrieved_at="2026-01-01T00:00:00Z")
+
+    assert len(core["publications"]) == 1
+    pub = core["publications"][0]
+    assert pub["author_source"] == "detail"
+    assert pub["publication_year"] == 2024
+    assert pub["publication_date"] == "2024-12-31"
+    assert pub["category"] == "journal"
+    assert pub["volume"] == "5"
+    assert pub["issue"] == "2"
+    assert pub["publisher"] == "Penerbit Telkom"
+    assert pub["link"] == "https://example.com/paper"
+    assert pub["doi"] is None
+
+    pa = core["publication_authors"][0]
+    assert pa["publication_index"] == 0
+    assert pa["author_name"] == "Budi Santoso"
+    assert pa["author_order"] == 0
+
+    pm = core["publication_metrics"][0]
+    assert pm["citation_count"] == 10
+    assert pm["retrieved_at"] == "2026-01-01T00:00:00Z"
+    assert pm["source"] == "google_scholar"
+    assert pm["index_name"] == INDEX_NAME
+
+    # publications dan publication_metrics harus sejajar per indeks.
+    assert len(core["publications"]) == len(core["publication_metrics"])
+
+
+# ------------------------------------------------------------
+# to_core_rows: jalur list (tanpa detail, fallback ke halaman daftar)
+# ------------------------------------------------------------
+
+def test_to_core_rows_jalur_list():
+    """Tanpa field detail, penulis dari `authors` dan volume dari `extra`."""
+    raw = {
+        "rows": [{
+            "title": "Judul List",
+            "authors": "B. Santoso, A. Rahman",
+            "venue": "Journal of Testing",
+            "extra": "3(2), 45-60",
+            "citations": 5,
+            "year": "2024",
+        }],
+    }
+    core = to_core_rows(raw)
+
+    pub = core["publications"][0]
+    assert pub["author_source"] == "list"
+    assert pub["publication_year"] == 2024        # dari _tahun_int(year)
+    assert pub["publication_date"] is None
+    assert pub["category"] is None
+    assert pub["volume"] == "3"                   # fallback extra
+    assert pub["pages"] == "45-60"                # fallback extra
+    assert pub["publisher"] is None
+    assert pub["link"] is None
+
+    assert core["publication_authors"][0]["author_name"] == "B. Santoso"
+
+
+# ------------------------------------------------------------
+# to_core_rows: fallback volume/pages per-field, bukan borongan
+# ------------------------------------------------------------
+
+def test_to_core_rows_fallback_per_field():
+    """Tiap field volume/pages di-fallback sendiri-sendiri bila None."""
+    # Kasus A: detail_volume ada, detail_pages None -> pages dari extra.
+    raw_a = {
+        "rows": [{
+            "title": "Kasus A",
+            "authors": "A",
+            "extra": "45-60",
+            "citations": 0,
+            "detail_volume": "5",
+            "detail_pages": None,
+        }],
+    }
+    pub_a = to_core_rows(raw_a)["publications"][0]
+    assert pub_a["volume"] == "5"        # dari detail
+    assert pub_a["pages"] == "45-60"     # fallback extra
+
+    # Kasus B: detail_pages ada, detail_volume None -> volume dari extra.
+    raw_b = {
+        "rows": [{
+            "title": "Kasus B",
+            "authors": "A",
+            "extra": "3(2), 45-60",
+            "citations": 0,
+            "detail_volume": None,
+            "detail_pages": "53-58",
+        }],
+    }
+    pub_b = to_core_rows(raw_b)["publications"][0]
+    assert pub_b["volume"] == "3"        # fallback extra
+    assert pub_b["pages"] == "53-58"     # dari detail
+
+
+# ------------------------------------------------------------
+# to_core_rows: rows kosong tetap menghasilkan bentuk lima kunci
+# ------------------------------------------------------------
+
+def test_to_core_rows_rows_kosong():
+    """rows kosong -> list kosong, tapi dict authors/author_metrics ada."""
+    core = to_core_rows({"rows": []})
+
+    assert core["publications"] == []
+    assert core["publication_authors"] == []
+    assert core["publication_metrics"] == []
+
+    assert "authors" in core
+    assert core["authors"]["name"] is None
+    assert "author_metrics" in core
+    assert core["author_metrics"]["source"] == SOURCE
+
+
+# ------------------------------------------------------------
+# to_core_rows: retrieved_at string kosong dinormalkan jadi None
+# ------------------------------------------------------------
+
+def test_to_core_rows_retrieved_at_kosong():
+    """retrieved_at="" tidak boleh tersimpan sebagai string kosong."""
+    raw = {"rows": [{
+        "title": "X",
+        "authors": "A",
+        "year": "2024",
+        "citations": 1,
+    }]}
+    core = to_core_rows(raw, retrieved_at="")
+
+    assert core["publication_metrics"][0]["retrieved_at"] is None
+    assert core["author_metrics"]["retrieved_at"] is None

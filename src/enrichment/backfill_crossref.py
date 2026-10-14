@@ -463,12 +463,18 @@ def _sql_pilih(maks=None):
 
     WHERE doi IS NULL membuat run berulang melewati baris yang sudah
     terisi, jadi skrip ini idempoten.
+
+    publication_year ikut diambil karena dipakai sebagai tahun_awal
+    gerbang tahun: setelah migrasi 06, publication_date baris lama
+    NULL, jadi tanpa kolom ini gerbang TAHUN_TIDAK_COCOK terlewati
+    diam-diam.
     """
     stmt = (
         sa.select(
             PUBLICATIONS.c.publications_id,
             PUBLICATIONS.c.title,
             PUBLICATIONS.c.publication_date,
+            PUBLICATIONS.c.publication_year,
         )
         .where(PUBLICATIONS.c.doi.is_(None))
         .order_by(PUBLICATIONS.c.publications_id)
@@ -693,8 +699,13 @@ def main(argv=None):
         if not total:
             print("  Tidak ada yang perlu diisi. Selesai.")
         else:
-            for nomor, (pid, judul, tanggal) in enumerate(rows, start=1):
-                tahun_awal = _tahun_publikasi(tanggal)
+            for nomor, (pid, judul, tanggal, tahun) in enumerate(rows, start=1):
+                # publication_year adalah sumber utama tahun_awal untuk
+                # gerbang tahun; publication_date (cadangan) NULL untuk
+                # baris lama setelah migrasi 06, jadi tanpa fallback ke
+                # publication_year gerbang TAHUN_TIDAK_COCOK terlewati.
+                tahun_awal = tahun if tahun is not None \
+                    else _tahun_publikasi(tanggal)
                 judul_baku = _normalisasi_judul(judul)
                 catatan_satu = {
                     "pid": pid,

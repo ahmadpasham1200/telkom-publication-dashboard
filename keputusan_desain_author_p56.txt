@@ -1,0 +1,547 @@
+================================================================================
+P56 — FINALISASI KEPUTUSAN DESAIN AUTHOR RAW (READ-ONLY)
+Tanggal: 14 Oktober 2026
+Repository: telkom-publication-dashboard (branch: main)
+Basis: rencana_implementasi_author_p55.txt + laporan P54/P54-A
+Status dokumen: FINALISASI KEPUTUSAN — tanpa implementasi
+================================================================================
+
+Catatan lingkup: dokumen ini menfinalisasi keputusan D-1..D-8 dari P55
+berdasarkan kesepakatan pengguna yang tertulis di instruksi P56, dan
+menerapkannya ke rancangan konseptual yang diperbarui. Laporan P55, P54, dan
+P54-A TIDAK diubah — dokumen ini pelengkap, bukan pengganti. Tidak ada kode,
+tes, fixture, migrasi, konfigurasi, atau database yang disentuh selama
+penyusunan.
+
+--------------------------------------------------------------------------------
+1. RINGKASAN KEPUTUSAN YANG SUDAH DISETUJUI PENGGUNA
+--------------------------------------------------------------------------------
+
+Kesepakatan pengguna (dari instruksi P56, dianggap FINAL):
+
+  K1. Lingkup tetap RAW-only: scraping Google Scholar -> database RAW ->
+      berhenti. Tanpa backfill, cleaning, enrichment, staging, atau
+      pemuatan CORE.
+  K2. Nama penulis dipertahankan persis sesuai teks dan urutan dari
+      Google Scholar.
+  K3. Setiap penulis disimpan sebagai entri individual terhubung ke
+      publikasi.
+  K4. `author_order` menyimpan urutan penulis dari Google Scholar
+      (0-based mengikuti urutan tampil; P54 §2.4).
+  K5. `author_role` memisahkan peran HANYA berdasarkan urutan:
+      - `penulis_pertama`  = penulis pada urutan pertama (author_order=0)
+      - `co_author`        = penulis pada urutan berikutnya (author_order>0)
+  K6. Status pemilik profil disimpan di kolom TERPISAH
+      `profile_owner_status`, kandidat nilai:
+      - `pemilik_profil`
+      - `bukan_pemilik_profil`
+      - `belum_terverifikasi`
+  K7. Pemilik profil ditentukan dari IDENTITAS profil Google Scholar yang
+      sedang di-scrape, BUKAN dari urutan. Orang yang sama bisa berstatus
+      `co_author` (role) sekaligus `pemilik_profil` (status) pada publikasi
+      yang sama — kedua kolom independen.
+  K8. `pemilik_profil` TIDAK boleh ditetapkan hanya dari kemiripan nama.
+      Identitas belum terverifikasi -> `belum_terverifikasi`.
+  K9. Jangan menganggap pemilik profil selalu penulis pertama (didukung
+      fixture P54-A: posisi 2, 3, dan 6).
+  K10. `data dosen/Data dosen.xlsx` boleh jadi referensi identitas; nama
+      sumber Google Scholar TIDAK BOLEH diganti nama Excel.
+  K11. Kolom RAW lama dipertahankan; tanpa backfill.
+  K12. HTTP 429 BUKAN bukti nama penulis tidak ada; tanpa teknik
+      penghindaran pembatasan Scholar.
+
+Implikasi terbesar terhadap P55: desain P55 menggabungkan peran dalam satu
+kolom `peran` ('pemilik'|'co_author'|'belum_terverifikasi'). Kesepakatan
+baru MEMISAHKAN dua dimensi:
+  - `author_role`  = fungsi murni dari author_order (selalu bisa diisi,
+                     tidak tergantung verifikasi apa pun),
+  - `profile_owner_status` = hasil verifikasi identitas pemilik profil.
+Ini menghapus ambiguitas P55 (peran 'belum_terverifikasi') dan menyelesaikan
+pertanyaan lama P54 Q1 ("penulis utama" = penulis pertama ATAU pemilik
+profil? Jawaban: keduanya dimensi berbeda, disimpan di kolom terpisah).
+
+--------------------------------------------------------------------------------
+2. TABEL FINALISASI D-1 .. D-8
+--------------------------------------------------------------------------------
+
+Legenda status: [DISETUJUI] = sudah diputuskan pengguna di P56;
+[REKOMENDASI] = menunggu persetujuan final pengguna saat tahap implementasi.
+
+--------------------------------------------------------------------------------
+D-1 — Kolom penanda sumber (`sumber`, `daftar_terpotong`)
+--------------------------------------------------------------------------------
+Pertanyaan: apakah tabel author RAW perlu kolom penanda asal-usul nama dan
+  keterbatasan daftar profil yang terpotong elipsis?
+Rekomendasi: YA — pertahankan kedua kolom dari P55:
+  sumber TEXT NOT NULL ('detail'|'daftar'),
+  daftar_terpotong BOOLEAN NOT NULL DEFAULT FALSE.
+Alasan teknis: K12 melarang anggapan "nama tidak ada" dari kegagalan
+  (429/blokir); tanpa penanda, perbedaan "daftar lengkap dari halaman
+  detail" vs "daftar terpotong dari profil" tidak dapat dijawab query tanpa
+  join + inferensi string. Empat kondisi sumber (P55 §6 brief) terpetakan:
+  (1) lengkap dari detail -> sumber='detail', terpotong=FALSE;
+  (2) hanya dari profil utuh -> sumber='daftar', terpotong=FALSE;
+  (3) profil terpotong -> sumber='daftar', terpotong=TRUE;
+  (4) nama tidak tersedia sama sekali -> nol baris author untuk publikasi
+  itu (tidak mengarang). Elipsis "..." memang penanda pemotongan Scholar
+  (bukti fixture profil_hlid.html:84; dibuang oleh _pecah_penulis).
+Dampak: kode (_pilih_sumber_penulis + deteksi elipsis), skema (+2 kolom),
+  tes (#3, #4, #5, #15).
+Status: [REKOMENDASI] — belum disebut eksplisit dalam kesepakatan P56;
+  sangat direkomendasikan agar K12 dapat diverifikasi dari data.
+
+--------------------------------------------------------------------------------
+D-2 — Nilai `author_role` (SUPERSEDED oleh K5)
+--------------------------------------------------------------------------------
+Pertanyaan P55: apakah `peran='pemilik'` hanya bila verifikasi lolos?
+Rekomendasi FINAL: kolom `author_role` berisi HANYA `penulis_pertama` |
+`co_author`, murni fungsi author_order. TIDAK ADA nilai pemilik di kolom ini
+(K5, K7). Pemisahan pemilik -> `profile_owner_status` (K6).
+Alasan teknis: peran berbasis urutan selalu deterministik (0 vs >0) bahkan
+  ketika identitas gagal diverifikasi; menggabungkan identitas ke peran
+  (desain P55) memaksa nilai 'belum_terverifikasi' menjadi "peran" yang
+  kabur. Desain baru: role tidak pernah NULL, tidak pernah menunggu
+  verifikasi, dan mendukung K7 (co_author + pemilik_profil serentak).
+Dampak: skema (author_role 2 nilai); kode (rule trivial author_order==0);
+  tes (#8, #9 kini menguji dua kolom secara independen).
+Status: [DISETUJUI] (K5 eksplisit).
+
+--------------------------------------------------------------------------------
+D-3 — scholar_id pada tabel author
+--------------------------------------------------------------------------------
+Pertanyaan: kapan baris author menyimpan scholar_id, dan nilainya dari mana?
+Rekomendasi: kolom scholar_id VARCHAR(50) nullable DIPERTAHANKAN; hanya
+  diisi pada baris yang profile_owner_status='pemilik_profil' (artinya:
+  verifikasi lolos DAN posisi cocok rantai kecocokan), nilainya = scholar_id
+  run yang di-scrape (fakta dari profil itu sendiri, bukan hasil pencarian
+  nama). Semua baris lain: NULL. Saat verifikasi gagal: TIDAK ADA baris yang
+  mengklaim ID (ID tetap utuh di raw.scholar_publication.scholar_id).
+Alasan teknis: mengikuti kebijakan existing "scholar_id hanya pemilik
+  profil" (postgres.py:1180-1182) dan guard K8; ID yang berasal dari run
+  sendiri bukan tebakan, tetapi penempatannya menunggu bukti kecocokan nama
+  profil -> posisi daftar.
+Dampak: kode (aturan pengisian); skema (kolom nullable); tes (#10, #11).
+Status: [REKOMENDASI] — sejalan K8/K10, tetapi detail penempatan perlu
+  konfirmasi final bersama persetujuan skema.
+
+--------------------------------------------------------------------------------
+D-4 — run_batch meneruskan `--referensi-dosen`
+--------------------------------------------------------------------------------
+Pertanyaan: apakah mode batch otomatis memakai file Excel yang sama sebagai
+  referensi verifikasi identitas?
+Rekomendasi: YA — _susun_argv (run_batch.py:499) menambahkan
+  `--referensi-dosen "<args.file>"`.
+Alasan teknis: batch sudah membaca file itu untuk daftar scraping; penerusan
+  otomatis menghilangkan risiko lupa argumen dan menjaga satu sumber
+  kebenaran. Single-run tetap bisa memakai default path atau tanpa referensi.
+Dampak: kode (1 baris argv), tes test_run_batch (assert flag pada argv).
+Status: [REKOMENDASI] — menunggu persetujuan (tidak disebut K1..K12).
+
+--------------------------------------------------------------------------------
+D-5 — Strategi memakai `_pecah_penulis` (impor vs opsi-B)
+--------------------------------------------------------------------------------
+Pertanyaan: bagaimana loader memakai pemecah nama yang sudah ada?
+Rekomendasi: opsi-A — loader mengimpor `_pecah_penulis` apa adanya dari
+  src/transformation/publications.py; NOL perubahan file transformation.
+Alasan teknis: fungsi murni, sudah teruji (test_transformation.py:349-358),
+  graf import bebas siklus (publications.py hanya stdlib — terverifikasi
+  P55). Menggandakan logika split berisiko divergensi perilaku antara jalur
+  RAW dan CORE.
+Dampak: kode (1 import); tes (regresi split existing).
+Status: [REKOMENDASI] — menunggu persetujuan.
+
+--------------------------------------------------------------------------------
+D-6 — Finalisasi nama tabel & constraint
+--------------------------------------------------------------------------------
+Pertanyaan: nama final tabel dan constraint unik.
+Rekomendasi: tabel `raw.scholar_publication_author`; constraint
+  `uq_raw_scholar_publication_author_pub_urutan UNIQUE (raw_publication_id,
+  author_order)`; PK `raw_publication_author_id SERIAL`.
+Alasan teknis: mengikuti pola repo (04:38/:78 SERIAL PK; 04:60-61/:134-135
+  pola uq_<tabel>_<kolom>); FK -> raw.scholar_publication(raw_publication_id)
+  terverifikasi sebagai PK (04:78); result_id BUKAN PK publikasi (P54 §4).
+Dampak: skema (DDL 10); tes (statement-shape, FK, ON CONFLICT).
+Status: [REKOMENDASI] — menunggu persetujuan final saat tahap skema.
+
+--------------------------------------------------------------------------------
+D-7 — Pemilik cocok di >1 posisi dalam satu publikasi
+--------------------------------------------------------------------------------
+Pertanyaan: bila nama pemilik terdeteksi di beberapa urutan publikasi yang
+  sama (kasus langka), mana yang diberi `pemilik_profil`?
+Rekomendasi: SEMUA posisi yang cocok rantai kecocokan diberi
+  profile_owner_status='pemilik_profil' (data dicatat apa adanya); baris
+  lain 'bukan_pemilik_profil'. scholar_id diisi di semua baris pemilik yang
+  terverifikasi itu (satu ID milik satu orang; kemunculan ganda adalah fakta
+  data halaman).
+Alasan teknis: membuat satu-satunya posisi "pemilik" secara paksa sama
+  dengan memilih tanpa bukti; kecocokan ganda jarang dan efeknya minimal.
+Dampak: kode (rule per-loop); tes (skenario langka opsional).
+Status: [REKOMENDASI] — menunggu persetujuan (alternatif: hanya kecocokan
+  pertama).
+
+--------------------------------------------------------------------------------
+D-8 — Default path `--referensi-dosen`
+--------------------------------------------------------------------------------
+Pertanyaan: perilaku default ketika operator tidak menentukan path referensi.
+Rekomendasi: default mengikuti "data dosen/Data dosen.xlsx" bila file eksis;
+  bila tidak ada/non-terbaca -> verifikasi dinonaktifkan (semua baris
+  `belum_terverifikasi`) + statistik `referensi_tidak_dipakai`; run TETAP
+  sukses (bukan error).
+Alasan teknis: mengikuti keputusan lama P55; gagal-verifikasi bukan
+  kegagalan data (K8 hanya melarang penetapan pemilik tanpa bukti, bukan
+  melarang run); konsisten dengan pola parser yang tidak melempar untuk
+  kondisi data wajar.
+Dampak: kode (argumen + muat peta); tes (path tidak ada -> run hijau).
+Status: [REKOMENDASI] — menunggu persetujuan.
+
+Ringkasan status:
+  DISETUJUI   : D-2 (via K5/K7; desain lama superseded)
+  REKOMENDASI : D-1, D-3, D-4, D-5, D-6, D-7, D-8
+  (Rekomendasi sejalan dengan semangat K1..K12 kecuali D-1/D-4 yang murni
+  keputusan teknis; semua menunggu konfirmasi pada gerbang Tahap 0/1.)
+
+--------------------------------------------------------------------------------
+3. KONSISTENSI ISTILAH (author_role, profile_owner_status, author_order)
+--------------------------------------------------------------------------------
+
+Pemeriksaan tugas #5 — hasil: KETIGA istilah dipakai konsisten dan terpisah:
+
+  author_order        INTEGER  — posisi penulis di daftar Scholar (0-based).
+                                 Sumber kebenaran urutan (K4). Nilai mentah
+                                 dari enumerate hasil split; tidak pernah
+                                 diurutkan ulang. Selalu terisi (NOT NULL).
+  author_role         TEXT     — SEMATA-MATA fungsi(author_order):
+                                   author_order = 0 -> 'penulis_pertama'
+                                   author_order > 0 -> 'co_author'
+                                 Tidak pernah memuat nilai identitas/pemilik.
+                                 Tidak NULL. Tidak tergantung verifikasi.
+  profile_owner_status TEXT   — SEMATA-MATA hasil verifikasi identitas pemilik
+                                 profil terhadap profil yang di-scrape (+opsi
+                                 referensi Excel): 'pemilik_profil' |
+                                 'bukan_pemilik_profil' | 'belum_terverifikasi'.
+                                 Tidak NULL (selalu salah satu dari tiga).
+
+Invarian desain yang dijaga:
+  I1. TIDAK ada nilai pemilik apa pun di dalam author_role (K5+K7).
+  I2. profile_owner_status TIDAK dibedakan oleh urutan: pemilik profil bisa
+      berada di urutan 0, 2, 3, atau 6 (fixture P54-A) dan tetap
+      'pemilik_profil' sementara role-nya 'penulis_pertama' atau 'co_author'
+      sesuai urutannya.
+  I3. Perubahan nama pada kolom terhadap P55: P55 memakai `urutan`, `peran`,
+      `verifikasi`; final P56 memakai `author_order` (menyamai istilah
+      klien dan konvensi core.publication_authors.author_order, 02:27),
+      `author_role`, `profile_owner_status`. Nama teks: `author_name`
+      (konsisten dengan keluarga author_*; kandidat alternatif `nama`
+      mengikuti gaya kolom raw lama — keputusan kecil di gerbang skema).
+  I4. Kolom RAW lama (authors, detail_authors, dst.) tidak berganti nama
+      dan tetap didefinisikan apa adanya (K11).
+
+--------------------------------------------------------------------------------
+4. ANALISIS: `belum_terverifikasi` — NILAI `profile_owner_status` ATAU
+   KOLOM STATUS IDENTITAS TERPISAH? (tugas #6)
+--------------------------------------------------------------------------------
+
+Opsi A (kandidat pengguna, K6): `belum_terverifikasi` sebagai NILAI ketiga
+  `profile_owner_status`.
+  Konsekuensi:
+  + Satu kolom, satu sumber kebenaran, tanpa NULL (NOT NULL dengan tiga
+    nilai eksplisit).
+  + Query sederhana: WHERE profile_owner_status = 'pemilik_profil'.
+  + Makna harfiah tepat: "status pemilik belum dapat ditetapkan" — karena
+    identitas belum terbukti, BAİK kemungkinan pemilik MAUPUN kemungkinan
+    bukan-pemilik tidak boleh diklaim (K8). Jika identitas terverifikasi
+    tetapi nama pemilik tidak ditemukan di daftar, status yang benar justru
+    'bukan_pemilik_profil' (bukti ketiadaan setelah verifikasi) — kasus ini
+    tetap terwakili.
+  − Ketika verifikasi gagal, seluruh baris publikasi menjadi
+    'belum_terverifikasi' — tidak ada pemisahan "kemungkinan besar bukan
+    pemilik". Ini disengaja: tanpa bukti, tanpa klaim.
+
+Opsi B: kolom terpisah `verifikasi_identitas` ('terverifikasi' |
+  'belum_terverifikasi') + `profile_owner_status` hanya ('pemilik_profil' |
+  'bukan_pemilik_profil', boleh NULL saat gagal verifikasi).
+  Konsekuensi:
+  + Memisahkan dimensi teknis (bukti verifikasi) dari dimensi bisnis
+    (kepemilikan).
+  − Membutuhkan NULL pada profile_owner_status (melanggar kesederhanaan
+    NOT NULL) ATAU nilai ketiga terselip juga di sana -> redundansi.
+  − Konsistensi antar-dua-kolom harus dijaga di banyak titik (gampang
+    bocor: verifikasi='belum' tetapi status='pemilik').
+  − Dua kolom untuk satu pertanyaan tunggal "apakah ini pemilik profil?".
+
+Rekomendasi (BUKAN persetujuan): Opsi A — `belum_terverifikasi` tetap sebagai
+nilai `profile_owner_status`, tanpa kolom verifikasi terpisah. Alasan utama:
+domain ketiga nilai sudah tertutup penuh (pemilik / bukan pemilik / tidak
+bisa diputuskan), kegagalan verifikasi adalah SATU-satunya alasan status
+tidak bisa diputuskan (K8), dan desain tanpa NULL paling konsisten dengan
+gaya skema repo. Konsekuensi yang diterima: ketika referensi identitas
+tidak tersedia (file hilang/ambigu/nama tak cocok), seluruh baris publikasi
+menghasilkan 'belum_terverifikasi' — konservatif, sesuai K8/K10, dan
+dapat diperbarui pada run berikutnya bila referensi sudah benar (append-per-
+run di RAW, tanpa backfill).
+Status: rekomendasi BELUM disetujui sebagai bentuk final — dikunci bersama
+persetujuan skema di Tahap 0/1. Catatan: kandidat nilai di K6 sudah sama
+dengan Opsi A, sehingga rekomendasi ini menyelaraskan, bukan menentang,
+kesepakatan pengguna.
+
+--------------------------------------------------------------------------------
+5. RANCANGAN KOLOM TABEL AUTHOR RAW (FINAL — menggabungkan P55 + K1..K12)
+--------------------------------------------------------------------------------
+
+  raw.scholar_publication_author (
+      raw_publication_author_id  SERIAL       PRIMARY KEY,
+      raw_publication_id         INTEGER      NOT NULL
+                                  REFERENCES raw.scholar_publication(
+                                      raw_publication_id),
+      author_order               INTEGER      NOT NULL,
+      author_name                TEXT         NOT NULL,
+      author_role                TEXT         NOT NULL,
+      profile_owner_status       TEXT         NOT NULL,
+      scholar_id                 VARCHAR(50),
+      sumber                     TEXT         NOT NULL,
+      daftar_terpotong           BOOLEAN      NOT NULL DEFAULT FALSE,
+      created_at                 TIMESTAMP    NOT NULL DEFAULT now(),
+      CONSTRAINT uq_raw_scholar_publication_author_pub_urutan
+          UNIQUE (raw_publication_id, author_order)
+  );
+
+Penjelasan (tipe | nullable | alasan):
+- raw_publication_author_id — SERIAL | NOT NULL | PK surrogate, ikut pola
+  raw (04:38/:78).
+- raw_publication_id — INTEGER | NOT NULL | FK -> raw.scholar_publication
+  (raw_publication_id); TERVERIFIKASI PK target (04:78). result_id bukan PK
+  publikasi (04:81/:134) sehingga tidak dipakai sebagai FK relasi ini.
+- author_order — INTEGER | NOT NULL | urutan tampil Scholar 0-based (K4).
+  Bagian UNIQUE gabungan; tidak diurutkan ulang loader.
+- author_name — TEXT | NOT NULL | teks PENULIS PERSIS dari sumber
+  (_pecah_penulis: strip per bagian + buang elipsis; tanpa pembalikan/kapital
+  ulang/pengayaan — K2). Kandidat nama fisik; alternatif `nama` (gaya raw
+  lama) diputuskan di gerbang skema.
+- author_role — TEXT | NOT NULL | 'penulis_pertama' | 'co_author' (K5;
+  rule di §3, invarian I1).
+- profile_owner_status — TEXT | NOT NULL | 'pemilik_profil' |
+  'bukan_pemilik_profil' | 'belum_terverifikasi' (K6; aturan di §6).
+- scholar_id — VARCHAR(50) | nullable | hanya baris pemilik terverifikasi
+  (D-3); co-author NULL permanen di lingkup ini.
+- sumber — TEXT | NOT NULL | 'detail' | 'daftar' (D-1).
+- daftar_terpotong — BOOLEAN | NOT NULL | DEFAULT FALSE (D-1); TRUE hanya
+  bila sumber='daftar' dan string asli memuat elipsis.
+- created_at — TIMESTAMP | NOT NULL | DEFAULT now() (konvensi 03:50).
+
+Constraint & deduplikasi:
+- UNIQUE (raw_publication_id, author_order) — satu penulis per posisi per
+  publikasi; ON CONFLICT DO NOTHING + fallback SELECT saat retry (RETURNING
+  kosong pada konflik — pola terverifikasi postgres.py:1423-1425, ditulis
+  ulang di P55 §3). Idempoten untuk retry run sama; append-per-run untuk
+  run berbeda (konsisten raw.scholar_publication).
+- TANPA unique nama (identitas orang tidak disamakan berdasarkan nama —
+  P54 §4, K10).
+- Tanpa CHECK constraint (ikuti gaya raw yang ada); validasi nilai di kode +
+  tes.
+- Kolom lama authors/detail_authors TETAP (K11); tanpa backfill: baris relasi
+  hanya untuk run baru (K1).
+
+--------------------------------------------------------------------------------
+6. ATURAN PENETAPAN STATUS & PENANGANAN KASUS KHUSUS
+--------------------------------------------------------------------------------
+
+Aturan `profile_owner_status` (per baris author, per run):
+  P1. Verifikasi LOLOS (nama profil #gsc_prf_in terdaftar di referensi
+      Excel dengan scholar_id yang sama persis dengan run — kecocokan eksak
+      setelah normalisasi spasi + casefold; tanpa fuzzy) DAN posisi ini
+      cocok rantai kecocokan (eksak casefold -> _bentuk_pendek ->
+      _varian_nama_pemilik[husus sumber detail], postgres.py:591-741):
+      baris ini 'pemilik_profil' + scholar_id=ID run. Baris lain pada
+      publikasi yang sama: 'bukan_pemilik_profil'.
+  P2. Verifikasi LOLOS tetapi TIDAK ADA posisi yang cocok (nama pemilik
+      tidak muncul di daftar publikasi ini): semua baris
+      'bukan_pemilik_profil'; statistik `pemilik_tidak_ditemukan`.
+  P3. Verifikasi GAGAL (tidak ada di Excel / ambigu / scholar_id berbeda /
+      Excel tidak ada atau tidak terbaca): TIDAK ADA 'pemilik_profil';
+      posisi yang cocok rantai kecocokan -> 'belum_terverifikasi'
+      (kandidat, tidak diklaim — K8); baris lain -> 'belum_terverifikasi'
+      juga (tanpa verifikasi, "bukan pemilik" pun tidak dapat dibuktikan);
+      semua scholar_id NULL; statistik `verifikasi_gagal`.
+  P4. Nama profil tidak terbaca: semua baris 'belum_terverifikasi'
+      (+statistik); jalur RAW tidak menggagalkan run untuk kondisi ini.
+
+Aturan `author_role`: murni §3 (author_order==0 -> 'penulis_pertama', else
+  'co_author') — berlaku di semua kondisi P1..P4 (role tidak menunggu
+  verifikasi; mendukung K7: co_author + pemilik_profil serentak).
+
+Penanganan kasus khusus (tugas #7):
+  a. NAMA AMBIGU di Excel (NAMA sama, scholar_id beda): kunci masuk set
+     ambigu -> verifikasi GAGAL -> P3 (belum_terverifikasi). Tanpa tebakan.
+  b. scholar_id KOSONG di Excel (10 dari 139 baris nyata): baris itu tidak
+     dipakai memverifikasi apa pun; bila tak ada kandidat lain -> P3.
+     Dosa baca_dosen lama (run_batch mencatat DILEWATI tanpa menebak ID)
+     dipertahankan.
+  c. DAFTA TERPOTONG: string daftar memuat elipsis -> hanya nama sebelum
+     elipsis yang jadi baris; elipsis tidak pernah jadi nama;
+     daftar_terpotong=TRUE (D-1). Tidak ada nama yang diarang untuk
+     melengkapi kehilangan.
+  d. DETAIL GAGAL (429/blokir/timeout): pre-fill None + break sudah ada
+     (scrape_scholar_playwright.py:913-976); fallback aturan sumber
+     (detail-first publications.py:479-484 diterapkan di loader); 429 BUKAN
+     alasan menghapus nama yang sudah ada (K12); tanpa retry agresif/rotasi/
+     identitas baru.
+  e. RETRY: ON CONFLICT (raw_publication_id, author_order) DO NOTHING +
+     fallback SELECT raw_publication_id saat RETURNING kosong; transaksi
+     atomik dengan envelope dipertahankan (postgres.py:2052-2091) -> retry
+     tidak menduplikasi dan tidak kehilangan data.
+  f. NAMA KOSONG/tidak terpecah: bagian kosong dan elipsis dibuang
+     (_pecah_penulis); bila seluruh string kosong -> nol baris author +
+     kolom sumber/terpotong tidak ada yang dikarang.
+
+--------------------------------------------------------------------------------
+7. MATRIKS TES (PENYELARASAN DENGAN FINAL P56)
+--------------------------------------------------------------------------------
+
+Matriks P55 §7 dipertahankan dengan penyesuaian kolom. 15 skenario, seluruhnya
+fixture lokal/synthetic, tanpa jaringan, tanpa DB bersama:
+
+ 1. Satu penulis      : 1 baris; author_order=0; role='penulis_pertama';
+                        author_name persis.
+ 2. >3 penulis (6)    : fixture detail_1.html; 6 baris; order 0..5 menaik;
+                        role pertama='penulis_pertama', sisanya 'co_author'.
+ 3. Detail lengkap    : sumber='detail'; daftar_terpotong=FALSE semua.
+ 4. Elipsis daftar    : sumber='daftar'; daftar_terpotong=TRUE; nol nama
+                        karangan.
+ 5. Detail gagal      : detail_authors=None -> sumber='daftar'; data ada
+                        dipertahankan.
+ 6. Inisial           : "TAD Kuntjoro" tersimpan persis (tanpa diperluas).
+ 7. Kapital/spasi     : kapitalisasi asli utuh; strip tepi per bagian;
+                        "Ph.D." tidak pecah (split hanya koma).
+ 8. Pemilik urutan 0  : role='penulis_pertama' + profile_owner_status=
+                        'pemilik_profil' (verifikasi lolos); sisanya
+                        'co_author' + 'bukan_pemilik_profil'.
+ 9. Pemilik urutan 2/3: role baris pemilik='co_author' (BUKAN penulis_
+                        pertama) + status='pemilik_profil' — mengunci K7/K9;
+                        baris urutan 0 tetap 'penulis_pertama' +
+                        'bukan_pemilik_profil'.
+10. Co-author tanpa ID: scholar_id NULL semua baris co_author.
+11. Nama ambigu Excel : xlsx tmp dengan NAMA kembar -> tanpa 'pemilik_profil';
+                        kandidat cocok -> 'belum_terverifikasi' (P3).
+12. scholar_id kosong : baris Excel tanpa ID tidak memverifikasi; run hijau;
+                        status 'belum_terverifikasi'.
+13. Penulis sama lintas publikasi: baris terpisah per publikasi (tanpa
+                        dedup identitas global).
+14. Retry            : insert ulang run sama -> 0 baris tambahan; fallback
+                        SELECT mengembalikan ID sama.
+15. HTTP 429         : A) FakePage 429 existing (test_scraper.py:1147-1186,
+                        :1213-1237, :1601-1614) dijalankan ulang; B) baris
+                        hasil 429 -> author rows dari daftar + sumber jujur.
+
+Tambahan kasus kecil (disarankan, non-wajib): pemilik cocok >1 posisi (D-7);
+verifikasi lolos tapi nama pemilik absen (P2).
+
+Tes database (publication_test): RENCANA, tidak dijalankan sekarang; guard
+wajib `SELECT current_database()` == publication_test sebelum SQL apa pun;
+cakupan: DDL idempoten, INSERT+conflict+retry, FK penolakan, cleanup hanya
+baris uji milik tes (tanpa TRUNCATE bersama).
+
+--------------------------------------------------------------------------------
+8. URUTAN IMPLEMENTASI DENGAN GERBANG PERSETUJUAN
+--------------------------------------------------------------------------------
+
+Tahap 0 — GERBANG PERSETUJUAN DESAIN (berlaku sekarang).
+  Isi: pengguna mengunci (a) rekomendasi D-1..D-8; (b) analisis §4
+  (belum_terverifikasi sebagai nilai profile_owner_status — Opsi A);
+  (c) nama fisik kolom author_name vs nama; (d) penerapan DDL pada
+  publication_test pada tahap lanjutan.
+  Kriteria: jawaban tertulis diterima. Tanpa ini, Tahap 1 tidak dimulai.
+
+Tahap 1 — Skema + helper murni + tes unit (tanpa DB/jaringan).
+  File (rencana): sql/ddl/10_create_raw_publication_author.sql (dibuat,
+  belum dieksekusi); src/loading/postgres.py (definisi tabel, statement
+  author, _pilih_sumber_penulis, aturan P1-P4 + role trivial);
+  src/loading/referensi_dosen.py (reader Excel murni);
+  tests/test_database.py, tests/test_referensi_dosen.py (baru), regresi
+  test_transformation.py.
+  Tes wajib: matriks #1-#14 unit + seluruh suite existing hijau.
+  Risiko: sentuh postgres.py yang berubah kumulatif — mitigasi diff ketat.
+  Gerbang berikutnya: tinjauan diff + hasil hijau.
+
+Tahap 2 — Integrasi loader + wiring pipeline.
+  File: postgres.py (write_raw_scrape_result + load_scholar_run meneruskan
+  referensi), run_pipeline.py (--referensi-dosen + statistik baru),
+  run_batch.py (bila D-4 disetujui), tes run_pipeline/run_batch/database.
+  Tes wajib: #5, #14, #15 + regresi penuh (termasuk 429 scraper).
+  Gerbang berikutnya: tinjauan diff; kunci statistik LAMA tidak berubah.
+
+Tahap 3 — GERBANG EKSLISIT: migrasi pada publication_test.
+  Persetujuan terpisah wajib (ijin DDL + konfirmasi guard nama database).
+  Kriteria: tabel ada, idempoten (jalankan 2x), FK+conflict bekerja, log
+  bukti. Produksi publication_dashboard = GERBANG TERPISAH lain (Tahap 5).
+
+Tahap 4 — Regresi penuh + audit hasil (pytest offline; audit query read-only
+  pada publication_test terhadap run uji; information_schema memastikan
+  tabel lama tak tersentuh).
+
+Tahap 5 — GERBANG TERPISAH: keputusan produksi & backfill (klien; sementara
+  TANPA backfill, K11). CORE/staging/matching lanjutan di luar lingkup.
+
+--------------------------------------------------------------------------------
+9. RISIKO YANG MASIH TERBUKA
+--------------------------------------------------------------------------------
+
+  R1. Selisih ejaan nama profil (#gsc_prf_in) vs NAMA Excel (gelar/sufiks)
+      -> verifikasi gagal -> dominasi 'belum_terverifikasi' pada data awal.
+      Tanpa fuzzy (K8); mitigasi: koreksi referensi Excel manual bila perlu.
+  R2. D-1..D-8 sebagian masih [REKOMENDASI] — tanpa kunci Tahap 0,
+      implementasi belum boleh mulai.
+  R3. Duplikat NAMA Excel di masa depan -> ambigu -> P3 otomatis (by design).
+  R4. Fallback SELECT retry wajib; tanpa ini retry silent-gagal (teruji #14).
+  R5. False-positif daftar_terpotong bila "..." sah di dalam nama (sangat
+      jarang) — hanya penanda, tidak mengubah nama.
+  R6. Opsi A (§4): saat referensi hilang, satu publikasi penuh
+      'belum_terverifikasi' — diterima sebagai konservatif; koreksi hanya
+      lewat run baru (RAW append-per-run, tanpa UPDATE/backfill).
+  R7. Kecepatan: +N INSERT per publikasi — negligible pada skala 139 dosen.
+  R8. Penamaan kolom (author_name vs nama) belum final — diputus di Tahap 0.
+
+--------------------------------------------------------------------------------
+10. KONFIRMASI KESELAMATAN
+--------------------------------------------------------------------------------
+
+Pemeriksaan working tree: kondisi SEBELUM dan SESUDAH penyusunan laporan ini
+identik — daftar file modified/untracked persis sama seperti sebelum P56
+dimulai, dengan satu penambahan TUNGGAL: file laporan
+keputusan_desain_author_p56.txt (baru; nama dipastikan belum terpakai).
+
+Yang TIDAK dilakukan (dipatuhi penuh):
+  - Tidak ada source code, tes, fixture, CSV, Excel, konfigurasi, maupun
+    file migrasi yang diubah/dibuat selain laporan ini.
+  - Tidak ada scraping, request jaringan, pipeline, atau batch.
+  - Tidak ada SQL mutasi/migrasi; tidak ada koneksi database;
+    publication_test dan publication_dashboard tidak disentuh.
+  - Tidak ada backfill atau pemuatan CORE.
+  - Tidak ada commit/push/reset/checkout/restore/clean/stash.
+  - Laporan P55, P54, dan P54-A TIDAK ditimpa (semua terverifikasi utuh).
+  - Tidak ada rahasia .env/connection string yang dicetak.
+
+================================================================================
+RINGKASAN TERMINAL P56
+================================================================================
+  Keputusan DISETUJUI pengguna & diterapkan : K1..K12; D-2 superseded oleh
+    desain dua-kolom (author_role + profile_owner_status).
+  Keputusan masih REKOMENDASI (butuh kunci Tahap 0):
+    D-1 penanda sumber, D-3 penempatan scholar_id, D-4 penerusan argv batch,
+    D-5 impor _pecah_penulis, D-6 nama constraint, D-7 pemilik ganda,
+    D-8 default path referensi, + analisis §4 (Opsi A) + nama kolom
+    author_name.
+  Desain final: 1 tabel RAW baru; author_order (urutan), author_role
+    (penulis_pertama|co_author — murni urutan), profile_owner_status
+    (pemilik_profil|bukan_pemilik_profil|belum_terverifikasi — murni
+    verifikasi identitas); pemilik bisa co_author serentak; tanpa asumsi
+    urutan 0; tanpa fuzzy; nama Scholar tak terganti; 429 bukan bukti nama
+    hilang; retry idempoten; tanpa backfill; kolom lama utuh.
+  Matriks tes: 15 skenario fixture-lokal (sinkron dengan kolom final) +
+    kasus opsional; DB test berpagar guard nama database.
+  File dibuat: keputusan_desain_author_p56.txt (P55/P54/P54-A utuh).
+
+  KONFIRMASI: TIDAK ADA kode, tes, fixture, migrasi, konfigurasi, database,
+  maupun perubahan kumulatif yang diubah. Tahap P56 SELESAI sebagai
+  finalisasi-desain. IMPLEMENTASI BELUM DIMULAI — menunggu persetujuan
+  Tahap 0 (kunci D-1..D-8 + §4 + nama kolom) dari pengguna.
+================================================================================

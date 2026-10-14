@@ -79,13 +79,44 @@ def test_baca_daftar_campuran_id_dan_kosong(tmp_path):
     hasil = run_batch.baca_daftar(xlsx)
 
     assert len(hasil) == 4
-    assert hasil[0] == {"no": 1, "nama": "Budi Santoso", "scholar_id": "AAA_id-1"}
+    assert hasil[0] == {"no": 1, "nama": "Budi Santoso",
+                        "scholar_id": "AAA_id-1", "prodi": "Informatika"}
     # Sel kosong (None) dan sel berisi spasi saja -> "".
     assert hasil[1]["scholar_id"] == ""
     assert hasil[1]["nama"] == "Siti Aminah"
     assert hasil[2]["scholar_id"] == ""
     # Baris setelah sel kosong tetap terbaca, tidak ikut "tersedak".
-    assert hasil[3] == {"no": 4, "nama": "Rina Marlina", "scholar_id": "CCC_id-3"}
+    assert hasil[3] == {"no": 4, "nama": "Rina Marlina",
+                        "scholar_id": "CCC_id-3",
+                        "prodi": "Teknik Logistik"}
+
+
+def test_baca_daftar_baca_prodi_case_insensitive(tmp_path):
+    """Kolom `PRODI` terdeteksi case-insensitive; sel kosong -> ""."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx",
+                      ["no", "Nama", "ProDI", "scholar_id"],
+                      [[1, "Budi Santoso", "Informatika", "AAA"],
+                       [2, "Siti Aminah", None, "BBB"],
+                       [3, "Andi Wijaya", "   ", "CCC"]])
+
+    hasil = run_batch.baca_daftar(xlsx)
+
+    assert hasil[0]["prodi"] == "Informatika"
+    # Sel kosong (None) dan sel berisi spasi saja -> "".
+    assert hasil[1]["prodi"] == ""
+    assert hasil[2]["prodi"] == ""
+
+
+def test_baca_daftar_tanpa_kolom_prodi(tmp_path):
+    """Kolom PRODI tidak ada -> bukan error; semua baris dapat ""."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx",
+                      ["No", "NAMA", "scholar_id"],
+                      [[1, "Budi Santoso", "AAA"],
+                       [2, "Siti Aminah", "BBB"]])
+
+    hasil = run_batch.baca_daftar(xlsx)
+
+    assert [h["prodi"] for h in hasil] == ["", ""]
 
 
 def test_baca_daftar_tanpa_kolom_scholar_id(tmp_path):
@@ -214,7 +245,11 @@ def _id_dipanggil(panggilan):
 
 
 def test_main_loop_kosong_tidak_dipanggil(tmp_path, monkeypatch):
-    """1 ID valid, 1 kosong, 1 valid -> scraper hanya 2x, status benar."""
+    """1 ID valid, 1 kosong, 1 valid -> scraper hanya 2x, status benar.
+
+    P13: default batch adalah RAW-only, jadi exit 0 dicatat OK_RAW
+    (bukan OK); argv ke anak selalu membawa --raw-only.
+    """
     xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_KELOMPOK, [
         [1, "Budi Santoso", "Aktif", "Informatika", 111, "ID_A"],
         [2, "Siti Aminah", "Aktif", "Informatika", 222, None],
@@ -233,14 +268,18 @@ def test_main_loop_kosong_tidak_dipanggil(tmp_path, monkeypatch):
     # Scraper dipanggil tepat 2x, untuk 2 ID valid, berurutan.
     assert _id_dipanggil(panggilan) == ["ID_A", "ID_B"]
     assert "" not in _id_dipanggil(panggilan)
-    # argv ke run_pipeline selalu membawa --id=..., --diam, --tampil=0.
+    # argv ke run_pipeline selalu membawa --id=..., --diam, --tampil=0,
+    # plus --raw-only (default P13).
     for argv in panggilan:
         assert argv[0].startswith("--id=")
         assert "--diam" in argv
         assert _nilai(argv, "--tampil") == "0"
+        assert "--raw-only" in argv
 
     data = run_batch.baca_progress(str(progress))
-    assert data["ID_A"]["status"] == "OK"
+    # Default RAW-only: exit 0 -> OK_RAW (raw tersimpan, core TIDAK
+    # diisi). Core hanya diisi kalau user eksplisit --load-core.
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK_RAW
     assert data["ID_A"]["exit_code"] == "0"
     assert data["ID_B"]["status"] == "GAGAL_LOAD"
     assert data["ID_B"]["exit_code"] == "1"
@@ -460,6 +499,41 @@ def test_argv_tampil_default_nol():
 
 
 # ============================================================
+# P58: --referensi-dosen (identitas pemilik profil)
+# ============================================================
+
+def test_argv_selalu_bawa_referensi_dosen():
+    """argv anak SELALU membawa --referensi-dosen=<file Excel batch>.
+
+    Batch memakai file Excel yang sama dengan yang di-scrape (--file)
+    sebagai referensi identitas pemilik profil; parse asli
+    run_pipeline menerimanya (uid + referensi_dosen round-trip).
+    Bentuk `=` dipakai karena path bisa mengandung spasi.
+    """
+    args = run_batch.parse_args(["--file", "x.xlsx"])
+    argv = run_batch._argv_run_pipeline(args, "ID_A")
+
+    assert "--referensi-dosen=x.xlsx" in argv
+
+    parsed = run_batch.run_pipeline.parse_args(argv)
+    assert parsed.uid == "ID_A"
+    assert parsed.referensi_dosen == "x.xlsx"
+
+
+def test_argv_referensi_dosen_path_berspasi():
+    """Path berisi spasi utuh sebagai SATU token --referensi-dosen=...
+    dan tetap terbaca benar oleh parse asli."""
+    path = "data dosen/Data dosen.xlsx"
+    args = run_batch.parse_args(["--file", path])
+    argv = run_batch._argv_run_pipeline(args, "ID_A")
+
+    assert "--referensi-dosen={}".format(path) in argv
+
+    parsed = run_batch.run_pipeline.parse_args(argv)
+    assert parsed.referensi_dosen == path
+
+
+# ============================================================
 # Bug 2: SystemExit (dilempar argparse) tidak boleh mematikan batch
 # ============================================================
 
@@ -501,7 +575,8 @@ def test_main_systemexit_tidak_mematikan_batch(tmp_path, monkeypatch):
     # Kode 2 -> _PETA_STATUS -> GAGAL_SCRAPE (bukan OK).
     assert data["ID_A"]["status"] == run_batch.STATUS_GAGAL_SCRAPE
     assert data["ID_A"]["exit_code"] == "2"
-    assert data["ID_B"]["status"] == run_batch.STATUS_OK
+    # Default P13 raw-only: exit 0 dicatat OK_RAW, bukan OK.
+    assert data["ID_B"]["status"] == run_batch.STATUS_OK_RAW
     # Ada kegagalan -> exit code batch 1.
     assert rc == 1
 
@@ -536,7 +611,8 @@ def test_main_systemexit_tanpa_kode_angka_jadi_gagal(tmp_path, monkeypatch):
     data = run_batch.baca_progress(str(progress))
     assert data["ID_A"]["status"] == run_batch.STATUS_GAGAL
     assert data["ID_A"]["exit_code"] == ""
-    assert data["ID_B"]["status"] == run_batch.STATUS_OK
+    # Default P13 raw-only: exit 0 dicatat OK_RAW, bukan OK.
+    assert data["ID_B"]["status"] == run_batch.STATUS_OK_RAW
     assert rc == 1
 
 
@@ -679,3 +755,193 @@ def test_baca_progress_baris_rusak_diabaikan(tmp_path):
     assert set(hasil) == {"ID_A", "ID_D"}
     assert hasil["ID_A"]["nama"] == "Budi"
     assert hasil["ID_D"]["nama"] == "Rina"
+
+
+# ============================================================
+# Mode raw-only
+# ============================================================
+
+def test_argv_raw_only_diteruskan():
+    """--raw-only di batch -> argv anak membawa --raw-only."""
+    args = run_batch.parse_args(["--file", "x.xlsx", "--raw-only"])
+    argv = run_batch._argv_run_pipeline(args, "ID_A")
+    assert "--raw-only" in argv
+    assert run_batch.run_pipeline.parse_args(argv).raw_only is True
+
+
+def test_argv_default_membawa_raw_only():
+    """P13: default batch = RAW-only.
+
+    Tanpa flag pun `args.raw_only` True, argv anak membawa
+    `--raw-only`, dan parse ASLI run_pipeline atas argv itu
+    menghasilkan raw_only=True.
+    """
+    args = run_batch.parse_args(["--file", "x.xlsx"])
+    assert args.raw_only is True
+    argv = run_batch._argv_run_pipeline(args, "ID_A")
+    assert "--raw-only" in argv
+    assert run_batch.run_pipeline.parse_args(argv).raw_only is True
+
+
+def test_load_core_explicit_mengembalikan_mode_lama():
+    """--load-core menyetel raw_only=False dan diteruskan ke anak
+    sebagai `--load-core` (TANPA `--raw-only`); parse asli anak
+    menghasilkan raw_only=False -> mode lama (isi staging/core)."""
+    args = run_batch.parse_args(["--file", "x.xlsx", "--load-core"])
+    assert args.raw_only is False
+    argv = run_batch._argv_run_pipeline(args, "ID_A")
+    assert "--load-core" in argv
+    assert "--raw-only" not in argv
+    assert run_batch.run_pipeline.parse_args(argv).raw_only is False
+
+
+def test_status_dari_exit_raw_only():
+    """Exit 0 di mode raw-only -> OK_RAW; mode lama -> OK."""
+    assert run_batch._status_dari_exit(0, raw_only=True) == run_batch.STATUS_OK_RAW
+    assert run_batch._status_dari_exit(0, raw_only=False) == run_batch.STATUS_OK
+    assert run_batch._status_dari_exit(1, raw_only=True) == run_batch.STATUS_GAGAL_LOAD
+    assert run_batch._status_dari_exit(2, raw_only=True) == run_batch.STATUS_GAGAL_SCRAPE
+    assert run_batch._status_dari_exit(99, raw_only=True) == run_batch.STATUS_GAGAL
+
+
+def test_ok_raw_terminal_untuk_lanjut():
+    """OK_RAW termasuk STATUS_TERMINAL -> --lanjut melewatkannya."""
+    assert run_batch.STATUS_OK_RAW in run_batch.STATUS_TERMINAL
+
+
+def test_main_raw_only_mencatat_ok_raw(tmp_path, monkeypatch):
+    """Batch --raw-only: exit 0 -> status OK_RAW di progress, bukan OK."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_KELOMPOK, [
+        [1, "Budi Santoso", "Aktif", "Informatika", 111, "ID_A"],
+    ])
+    progress = tmp_path / "progress.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress),
+        "--jeda", "0", "--raw-only",
+    ])
+
+    assert "--raw-only" in panggilan[0]
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK_RAW
+    assert data["ID_A"]["exit_code"] == "0"
+    assert rc == 0
+
+
+def test_main_default_raw_only_tanpa_flag(tmp_path, monkeypatch):
+    """P13: batch TANPA --raw-only (default) tetap berhenti di raw:
+    exit 0 -> OK_RAW di progress, argv anak membawa --raw-only,
+    rc == 0."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_KELOMPOK, [
+        [1, "Budi Santoso", "Aktif", "Informatika", 111, "ID_A"],
+    ])
+    progress = tmp_path / "progress.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress),
+        "--jeda", "0",
+    ])
+
+    # Tidak ada --raw-only di CLI, tapi default sudah RAW-only.
+    assert "--raw-only" in panggilan[0]
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK_RAW
+    assert data["ID_A"]["status"] != run_batch.STATUS_OK
+    assert data["ID_A"]["exit_code"] == "0"
+    assert rc == 0
+
+
+def test_main_load_core_explicit_memuat_core(tmp_path, monkeypatch):
+    """Dengan --load-core, exit 0 dicatat OK (mode lama: core terisi)
+    dan argv anak TIDAK membawa --raw-only."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_KELOMPOK, [
+        [1, "Budi Santoso", "Aktif", "Informatika", 111, "ID_A"],
+    ])
+    progress = tmp_path / "progress.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress),
+        "--jeda", "0", "--load-core",
+    ])
+
+    assert "--load-core" in panggilan[0]
+    assert "--raw-only" not in panggilan[0]
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK
+    assert rc == 0
+
+
+def test_main_lanjut_skip_ok_raw(tmp_path, monkeypatch):
+    """--lanjut melewatkan dosen berstatus OK_RAW (tidak dipanggil lagi)."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_KELOMPOK, [
+        [1, "Budi Santoso", "Aktif", "Informatika", 111, "ID_A"],
+        [2, "Andi Wijaya", "Aktif", "Teknik Elektro", 333, "ID_B"],
+    ])
+    progress = tmp_path / "progress.csv"
+    run_batch.tulis_progress(str(progress), {
+        "scholar_id": "ID_A", "nama": "Budi Santoso",
+        "status": run_batch.STATUS_OK_RAW, "exit_code": 0, "waktu": "",
+    })
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress),
+        "--jeda", "0", "--lanjut", "--raw-only",
+    ])
+
+    assert _id_dipanggil(panggilan) == ["ID_B"]
+    assert rc == 0
+
+
+def test_main_raw_only_exit_2_mencatat_gagal_scrape(tmp_path, monkeypatch):
+    """Batch --raw-only dengan run fatal: exit 2 -> status GAGAL_SCRAPE di
+    progress (BUKAN OK_RAW), exit_code '2', rc == 1."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_KELOMPOK, [
+        [1, "Budi Santoso", "Aktif", "Informatika", 111, "ID_A"],
+    ])
+    progress = tmp_path / "progress.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [2], panggilan)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress),
+        "--jeda", "0", "--raw-only",
+    ])
+
+    assert "--raw-only" in panggilan[0]
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_GAGAL_SCRAPE
+    assert data["ID_A"]["status"] != run_batch.STATUS_OK_RAW
+    assert data["ID_A"]["exit_code"] == "2"
+    assert rc == 1
+
+
+def test_main_lanjut_skip_gagal_scrape(tmp_path, monkeypatch):
+    """--lanjut melewatkan dosen berstatus GAGAL_SCRAPE (terminal, konsisten
+    kontrak resume) - tidak dipanggil lagi, rc == 0."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_KELOMPOK, [
+        [1, "Budi Santoso", "Aktif", "Informatika", 111, "ID_A"],
+        [2, "Andi Wijaya", "Aktif", "Teknik Elektro", 333, "ID_B"],
+    ])
+    progress = tmp_path / "progress.csv"
+    run_batch.tulis_progress(str(progress), {
+        "scholar_id": "ID_A", "nama": "Budi Santoso",
+        "status": run_batch.STATUS_GAGAL_SCRAPE, "exit_code": 2, "waktu": "",
+    })
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress),
+        "--jeda", "0", "--lanjut", "--raw-only",
+    ])
+
+    assert _id_dipanggil(panggilan) == ["ID_B"]
+    assert rc == 0

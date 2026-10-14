@@ -26,11 +26,20 @@ Kontrak input (dari scraper, diasumsikan sudah final):
         "rows": [                   # satu dict per publikasi
             {
                 "title":     str | None,
-                "authors":   str | None,   # "A B, C D, ..."
+                "authors":   str | None,   # "A B, C D, ..." (halaman daftar)
                 "venue":     str | None,
                 "extra":     str | None,   # gabungan volume/number/pages
                 "citations": int,
                 "year":      str | None,   # contoh: "2019"
+                "publication_year": int | None,  # tahun hasil parse baris daftar
+                "detail_url": str | None,  # URL halaman detail (absolut)
+                "detail_title": str | None, "detail_authors": str | None,
+                "detail_date": str | None, "detail_venue": str | None,
+                "detail_venue_label": str | None,  # "Jurnal" / "Konferensi"
+                "detail_volume": str | None, "detail_issue": str | None,
+                "detail_pages": str | None, "detail_publisher": str | None,
+                "detail_description": str | None, "detail_citations": str | None,
+                "detail_link": str | None, "detail_pdf_link": str | None,
             },
             ...
         ],
@@ -54,6 +63,7 @@ hasil transformasi.
 """
 
 import collections
+import datetime
 import re
 
 # ------------------------------------------------------------
@@ -121,6 +131,62 @@ def _normalisasi_tahun(nilai):
     if tahun is None or not _TAHUN_POLA.match(tahun):
         return None
     return "{}-01-01".format(tahun)
+
+
+def _tahun_int(nilai):
+    """Ambil tahun 4 digit pertama dari teks bebas, atau None.
+
+    Dipakai untuk kolom publication_year (INTEGER). Berbeda dari
+    _normalisasi_tahun yang menghasilkan string DATE: di sini
+    hasilnya angka, dan teks seperti "2024-2025" / "in press"
+    ditangani dengan mengambil tahun pertama yang terlihat.
+    """
+    teks = _rapikan_teks(nilai)
+    if teks is None:
+        return None
+    cocok = re.search(r"(19|20)[0-9]{2}", teks)
+    return int(cocok.group(0)) if cocok else None
+
+
+def _normalisasi_tanggal_detail(nilai):
+    """Ubah tanggal detail Scholar (YYYY/MM/DD) menjadi string DATE.
+
+    Hanya tanggal LENGKAP (tahun/bulan/tanggal) yang diterima.
+    Tanggal parsial (hanya tahun, atau tahun/bulan) -> None, BUKAN
+    1 Januari: publikasi tanpa tanggal lengkap tidak boleh memakai
+    tanggal sintetis lagi. Tanggal yang mustahil (mis. 2024/13/45)
+    juga -> None.
+    """
+    teks = _rapikan_teks(nilai)
+    if teks is None:
+        return None
+    cocok = re.match(r"^([0-9]{4})/([0-9]{1,2})/([0-9]{1,2})$", teks)
+    if not cocok:
+        return None
+    tahun, bulan, hari = (int(g) for g in cocok.groups())
+    try:
+        return datetime.date(tahun, bulan, hari).isoformat()
+    except ValueError:
+        return None
+
+
+def turunan_kategori(label_venue):
+    """Turunkan kategori publikasi dari LABEL venue halaman detail.
+
+    Heuristik, BUKAN data sumber: Scholar tidak menyediakan kategori
+    eksplisit. Label "Jurnal" -> 'journal', "Konferensi" ->
+    'conference', selain itu None. Fungsi ini sengaja terpisah dan
+    mudah dimatikan (cukup hentikan pemanggilannya) kalau kategori
+    turunan tidak diinginkan.
+    """
+    label = _rapikan_teks(label_venue)
+    if label is None:
+        return None
+    if "jurnal" in label.lower():
+        return "journal"
+    if "konferensi" in label.lower():
+        return "conference"
+    return None
 
 
 def _pecah_penulis(nilai):
@@ -357,6 +423,10 @@ def to_core_rows(raw, retrieved_at=None):
           "publication_metrics": list    (satu dict per baris `rows`)
         }
 
+    Kunci handoff tambahan: publications[i]["author_source"] ('detail'
+    atau 'list') menandai asal daftar penulis untuk kebijakan
+    publication_authors di loader (lihat keputusan 3j).
+
     Kunci di dalam tiap dict adalah nama kolom di DDL core, dengan
     nilai None untuk kolom yang belum bisa diisi pada tahap ini
     (lihat blok "CELAH YANG SENGAJA TIDAK DIPETAHKAN" di akhir
@@ -402,21 +472,57 @@ def to_core_rows(raw, retrieved_at=None):
         # dengan publication_metrics[i] dan publication_index = i.
         # Urutan BARU TIDAK diubah, sehingga pemanggil tidak perlu
         # mencari publications_id berdasarkan isi.
+        # Sumber penulis (keputusan 3j): halaman detail otoritatif
+        # kalau detail_authors terisi; selain itu daftar halaman daftar.
+        # author_source adalah kunci handoff (bukan kolom DB) yang
+        # dipakai loader untuk kebijakan publication_authors.
+        if _rapikan_teks(baris_pub.get("detail_authors")):
+            author_source = "detail"
+            daftar_penulis = baris_pub.get("detail_authors")
+        else:
+            author_source = "list"
+            daftar_penulis = baris_pub.get("authors")
+
+        # volume/pages: halaman detail lebih disukai; kalau salah satu
+        # tidak tersedia, fallback ke parser kolom `extra` halaman daftar.
+        volume = _rapikan_teks(baris_pub.get("detail_volume"))
+        pages = _rapikan_teks(baris_pub.get("detail_pages"))
+        if volume is None or pages is None:
+            hasil_extra = pecah_extra_volume_pages(baris_pub.get("extra"))
+            if volume is None:
+                volume = hasil_extra.volume
+            if pages is None:
+                pages = hasil_extra.pages
+
         publications.append({
             "publications_id": _BELUM_ADA,   # SERIAL, diisi database
             "title": _rapikan_teks(baris_pub.get("title")),
-            "publication_date": _normalisasi_tahun(baris_pub.get("year")),
+            # publication_year selalu dari tahun halaman daftar (scraper
+            # sudah menyediakannya); fallback parse di sini untuk input
+            # lama yang belum membawa kunci itu.
+            "publication_year": baris_pub.get("publication_year")
+                                or _tahun_int(baris_pub.get("year")),
+            # publication_date HANYA dari tanggal LENGKAP halaman detail
+            # (YYYY/MM/DD). Tanggal parsial -> None, bukan 1 Januari.
+            "publication_date": _normalisasi_tanggal_detail(
+                baris_pub.get("detail_date")),
             # fidelity RENDAH: `venue` dari Scholar adalah teks bebas
             # ("Journal of X, vol. 3, 2019, IEEE"), bukan nama jurnal
             # yang bersih. Dipetakan 1:1 apa adanya supaya tidak ada
             # data yang hilang, tapi jangan dianggap sudah rapi.
             "journal": _rapikan_teks(baris_pub.get("venue")),
-            "volume": None,           # ada di row["extra"], lihat akhir file
-            "pages": None,            # ada di row["extra"], lihat akhir file
-            "publisher": None,        # tidak ada di sumber Scholar
-            "description": None,      # tidak ada di sumber Scholar
-            "category": None,         # tidak ada di sumber Scholar
+            "volume": volume,
+            "pages": pages,
+            "issue": _rapikan_teks(baris_pub.get("detail_issue")),
+            "publisher": _rapikan_teks(baris_pub.get("detail_publisher")),
+            "description": _rapikan_teks(baris_pub.get("detail_description")),
+            "category": turunan_kategori(baris_pub.get("detail_venue_label")),
+            "link": _rapikan_teks(baris_pub.get("detail_link")),
             "doi": None,              # tidak ada di sumber Scholar
+            # author_source: BUKAN kolom DB, kunci handoff ke loader
+            # untuk kebijakan publication_authors (detail -> tulis ulang,
+            # list -> hanya kalau belum punya relasi).
+            "author_source": author_source,
         })
 
         # citation_count: `citations` selalu int dari scraper (0 kalau
@@ -443,7 +549,7 @@ def to_core_rows(raw, retrieved_at=None):
         # author_order memakai indeks 0-based yang sama dengan
         # publication_index, jadi urutan penulis dan urutan publikasi
         # konsisten di seluruh hasil mapper.
-        for urutan, nama in enumerate(_pecah_penulis(baris_pub.get("authors"))):
+        for urutan, nama in enumerate(_pecah_penulis(daftar_penulis)):
             publication_authors.append({
                 # publication_index: BUKAN kolom DB, tapi kunci
                 # handoff ke pemanggil. Penanda posisi (0-based) di
@@ -595,9 +701,13 @@ def to_core_rows(raw, retrieved_at=None):
 #     sampai ada sumber yang bisa diurai bersih atau ada keputusan
 #     eksplisit soal aturannya.
 #
-# - publications.publisher / description / category / doi
-#     Tidak ada di profil Scholar sama sekali. Butuh sumber lain
-#     (mis. Crossref / SINTA) atau scraping tambahan.
+# - publications.doi
+#     Tidak ada di Scholar sama sekali (0 kemunculan "doi" di halaman
+#     detail). Satu-satunya sumber DOI adalah backfill_crossref.py.
+#     publisher / description / category / issue / link / volume /
+#     pages kini diisi dari halaman detail (lihat 3b/3d); category
+#     adalah turunan heuristik dari label venue (turunan_kategori),
+#     bukan data sumber.
 #
 # - authors.sinta_id / scopus_id / program_study / faculty
 #     Semuanya atribut institutional, bukan atribut indeks sitasi.

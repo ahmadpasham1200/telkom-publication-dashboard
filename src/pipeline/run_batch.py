@@ -41,8 +41,9 @@ Exit code (main() mengembalikan int)
           tidak ada).
     130 = KeyboardInterrupt; ringkasan tetap dicetak.
 
-Exit code run_pipeline yang dibaca: 0 -> OK, 1 -> GAGAL_LOAD,
-2 -> GAGAL_SCRAPE. Exit code 130 berarti interupsi: batch berhenti
+Exit code run_pipeline yang dibaca: 0 -> OK_RAW (default) atau OK
+(--load-core), 1 -> GAGAL_LOAD, 2 -> GAGAL_SCRAPE. Exit code 130
+berarti interupsi: batch berhenti
 rapi TANPA menulis record untuk dosen itu. Exception tak terduga
 yang bocor dari run_pipeline.main -> GAGAL. SystemExit (dilempar
 argparse lewat sys.exit, dan BUKAN Exception) juga ditangkap per
@@ -55,6 +56,12 @@ Cara menjalankan
     python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx"
     python src/pipeline/run_batch.py --file ... --lanjut --jeda 10
     python src/pipeline/run_batch.py --file ... --mulai 50 --ulang
+    python src/pipeline/run_batch.py --file ... --load-core
+
+Default batch adalah RAW-ONLY: tiap dosen berhenti setelah envelope
+tersimpan di raw (status OK_RAW di progress). Staging/core TIDAK
+diisi otomatis; pakai --load-core untuk kembali ke mode lama (OK =
+core terisi).
 
 Catatan: `--batch` di CLI ini BUKAN nama fitur batch runner; itu
 batas klik "Tampilkan lainnya" yang diteruskan ke run_pipeline
@@ -102,6 +109,7 @@ from src.pipeline import run_pipeline  # noqa: E402
 KOLOM_PROGRESS = ["scholar_id", "nama", "status", "exit_code", "waktu"]
 
 STATUS_OK = "OK"
+STATUS_OK_RAW = "OK_RAW"
 STATUS_GAGAL_LOAD = "GAGAL_LOAD"
 STATUS_GAGAL_SCRAPE = "GAGAL_SCRAPE"
 STATUS_DILEWATI = "DILEWATI"
@@ -111,7 +119,8 @@ STATUS_GAGAL = "GAGAL"
 # melewatkannya. GAGAL sengaja TIDAK ada di sini: kegagalan tak
 # terduga harus dicoba ulang oleh --lanjut.
 STATUS_TERMINAL = frozenset({
-    STATUS_OK, STATUS_GAGAL_LOAD, STATUS_GAGAL_SCRAPE, STATUS_DILEWATI,
+    STATUS_OK, STATUS_OK_RAW, STATUS_GAGAL_LOAD, STATUS_GAGAL_SCRAPE,
+    STATUS_DILEWATI,
 })
 
 DEFAULT_PROGRESS = "data dosen/progress_batch.csv"
@@ -124,6 +133,17 @@ _PETA_STATUS = {
     1: STATUS_GAGAL_LOAD,
     2: STATUS_GAGAL_SCRAPE,
 }
+
+
+def _status_dari_exit(exit_code, raw_only):
+    """Petakan exit code run_pipeline.main() ke status progress.
+
+    Mode raw-only memetakan exit 0 ke OK_RAW (raw tersimpan, core
+    TIDAK terisi) supaya tidak disamakan dengan OK (core terisi).
+    """
+    if exit_code == 0:
+        return STATUS_OK_RAW if raw_only else STATUS_OK
+    return _PETA_STATUS.get(exit_code, STATUS_GAGAL)
 
 
 class KolomScholarIdHilang(SystemExit, argparse.ArgumentTypeError):
@@ -155,8 +175,10 @@ def _teks_nilai(nilai):
 def baca_daftar(file_path: str) -> list:
     """Baca daftar dosen dari Excel -> list dict per baris DATA.
 
-    Tiap dict berisi `no`, `nama`, `scholar_id` (string hasil strip;
-    sel kosong/None/putih -> ""). Kolom `scholar_id` dideteksi
+    Tiap dict berisi `no`, `nama`, `scholar_id`, dan `prodi`
+    (string hasil strip; sel kosong/None/putih -> ""). Kolom
+    `scholar_id` WAJIB ada; kolom `prodi` OPSIONAL - kalau tidak
+    ada di header, semua baris mendapat "". Semuanya dideteksi
     case-insensitive terhadap baris pertama (header). Baris yang
     seluruhnya kosong dilewati.
 
@@ -202,14 +224,18 @@ def baca_daftar(file_path: str) -> list:
                     [str(c).strip() for c in header if c is not None]) or
                     "(tidak ada)"))
 
-        # `no` dan `nama` dicari case-insensitive juga; kalau tidak
-        # ada, jatuh ke posisi kolom pertama dan kedua.
+        # `no`, `nama`, dan `prodi` dicari case-insensitive juga.
+        # `no`/`nama` jatuh ke posisi kolom pertama dan kedua kalau
+        # tidak ada; `prodi` bersifat OPSIONAL - tanpa kolomnya semua
+        # baris mendapat "" (bukan error), karena prodi hanya
+        # pelengkap identitas pemilik profil.
         idx_scholar = judul.index("scholar_id")
         idx_no = judul.index("no") if "no" in judul else 0
         idx_nama = judul.index("nama") if "nama" in judul else 1
+        idx_prodi = judul.index("prodi") if "prodi" in judul else None
 
         def _sel(baris, idx):
-            if idx >= len(baris):
+            if idx is None or idx >= len(baris):
                 return ""
             return baris[idx]
 
@@ -223,6 +249,7 @@ def baca_daftar(file_path: str) -> list:
                 "no": _sel(baris, idx_no),
                 "nama": _teks_nilai(_sel(baris, idx_nama)),
                 "scholar_id": _teks_nilai(_sel(baris, idx_scholar)),
+                "prodi": _teks_nilai(_sel(baris, idx_prodi)),
             })
         return hasil
     finally:
@@ -416,6 +443,22 @@ def parse_args(argv=None):
             "  python src/pipeline/run_batch.py --file \"data dosen/Data dosen.xlsx\"\n"
             "  python src/pipeline/run_batch.py --file ... --lanjut --jeda 10\n"
             "  python src/pipeline/run_batch.py --file ... --mulai 50 --ulang\n"
+            "  python src/pipeline/run_batch.py --file ... --load-core\n"
+            "\n"
+            "Default: RAW-ONLY - berhenti setelah simpan ke raw\n"
+            "(status OK_RAW). --load-core: lanjutkan ke staging/core.\n"
+            "\n"
+            "Status progress:\n"
+            "  OK_RAW  raw tersimpan, core tidak diisi (exit 0). Ini\n"
+            "          mencakup run SUCCESS maupun PARTIAL_SUCCESS.\n"
+            "          OK_RAW terminal: --lanjut MELEWATInya.\n"
+            "PARTIAL_SUCCESS artinya ada data berhasil diambil tapi\n"
+            "proses ditandai parsial (mis. batas --batch tercapai).\n"
+            "Cek error_message dan failures di envelope RAW.\n"
+            "Kalau hasil perlu dilengkapi: --ulang memaksa SEMUA dosen\n"
+            "diulang (mengalahkan --lanjut); atau jalankan ulang satu\n"
+            "profil dengan run_pipeline --id <SCHOLAR_ID>. Perbedaan:\n"
+            "--ulang mengulang seluruh daftar; --id hanya satu profil.\n"
         ),
     )
     p.add_argument("--file", required=True,
@@ -450,6 +493,12 @@ def parse_args(argv=None):
                    help="[diteruskan] URL koneksi PostgreSQL lengkap")
     p.add_argument("--echo-sql", action="store_true",
                    help="[diteruskan] Cetak SQL yang dijalankan")
+    p.add_argument("--raw-only", action="store_true", default=True,
+                   help="[diteruskan] Hanya scrape dan simpan ke raw; "
+                        "tidak loading ke staging/core (INI DEFAULT)")
+    p.add_argument("--load-core", dest="raw_only", action="store_false",
+                   help="[diteruskan] Kebalikan --raw-only: lanjutkan "
+                        "transformasi/loading ke staging/core (mode lama)")
     return p.parse_args(argv)
 
 
@@ -469,8 +518,8 @@ def _argv_run_pipeline(args, uid: str) -> list:
     sys.exit(2) -> batch mati tepat di dosen itu. Bentuk
     `--id=-zWuOpYAAAAJ` aman karena tokennya diawali `--id=`,
     bukan `-`. Konsisten diterapkan ke `--id`, `--batch`,
-    `--tampil`, dan `--url`; `--headed`/`--diam`/`--echo-sql`
-    memang flag tanpa nilai.
+    `--tampil`, `--url`, dan `--referensi-dosen`;
+    `--headed`/`--diam`/`--echo-sql` memang flag tanpa nilai.
     """
     argv = ["--id={}".format(uid), "--diam"]
     if args.headed:
@@ -479,10 +528,23 @@ def _argv_run_pipeline(args, uid: str) -> list:
         argv.append("--batch={}".format(args.batch))
     argv.append("--tampil={}".format(
         0 if args.tampil is None else args.tampil))
+    # Referensi identitas pemilik profil: batch SELALU memakai file
+    # Excel yang sama dengan yang di-scrape (--file) - kolom
+    # `nama` + `scholar_id` di situ adalah identitas pemilik profil.
+    # Bentuk `=` dipakai karena path bisa mengandung spasi
+    # ("data dosen/Data dosen.xlsx").
+    argv.append("--referensi-dosen={}".format(args.file))
     if args.url:
         argv.append("--url={}".format(args.url))
     if args.echo_sql:
         argv.append("--echo-sql")
+    # Mode diungkapkan EKSPLISIT ke anak, apa pun default-nya, supaya
+    # perilaku anak tidak bergantung pada default yang bisa berubah:
+    # raw_only (default P13) -> --raw-only; --load-core -> --load-core.
+    if args.raw_only:
+        argv.append("--raw-only")
+    else:
+        argv.append("--load-core")
     return argv
 
 
@@ -620,7 +682,7 @@ def main(argv=None):
                     # run_pipeline.main() yang mengembalikan kode itu,
                     # ikut jalur _PETA_STATUS seperti biasa.
                     exit_code = exc.code
-                    status = _PETA_STATUS.get(exit_code, STATUS_GAGAL)
+                    status = _status_dari_exit(exit_code, args.raw_only)
                     exit_code_simpan = exit_code
                     print("  SystemExit(code={}) dari run_pipeline "
                           "ditangkap; batch tetap lanjut.".format(
@@ -646,7 +708,7 @@ def main(argv=None):
                     # run_pipeline menangkap KeyboardInterrupt sendiri.
                     terputus = True
                     break
-                status = _PETA_STATUS.get(exit_code, STATUS_GAGAL)
+                status = _status_dari_exit(exit_code, args.raw_only)
                 exit_code_simpan = exit_code
 
             record = {
@@ -670,15 +732,18 @@ def main(argv=None):
 
     # ---------- RINGKASAN ----------
     _garis("RINGKASAN BATCH")
-    sukses = [x for x in ringkasan if x[0]["status"] == STATUS_OK]
-    gagal = [x for x in ringkasan
-             if x[0]["status"] != STATUS_OK]
+    STATUS_SUKSES = frozenset({STATUS_OK, STATUS_OK_RAW})
+    sukses = [x for x in ringkasan if x[0]["status"] in STATUS_SUKSES]
+    gagal = [x for x in ringkasan if x[0]["status"] not in STATUS_SUKSES]
 
     print("  Total baris data      : {}".format(total))
     print("  Dilewati (tanpa profil): {}".format(len(tanpa_profil)))
     print("  Dilewati (--lanjut)    : {}".format(dilewati_lanjut))
     print("  Dipanggil scraper      : {}".format(len(dipanggil)))
-    print("  Sukses (OK)            : {}".format(len(sukses)))
+    print("  Sukses (OK)            : {}".format(
+        len([x for x in sukses if x[0]["status"] == STATUS_OK])))
+    print("  Sukses (OK_RAW)        : {}".format(
+        len([x for x in sukses if x[0]["status"] == STATUS_OK_RAW])))
     print("  Gagal                  : {}".format(len(gagal)))
 
     # Penambah nilai: kalau DB bisa dibaca, tunjukkan mana yang
@@ -699,13 +764,22 @@ def main(argv=None):
                            if not v["ada_baris"]]
                 print()
                 print("  Dari raw.scholar_scrape_result (run terakhir):")
-                print("    punya baris (kemungkinan LOADED) : {}"
-                      .format(len(loaded)))
-                print("    tanpa baris (kemungkinan SKIPPED): {}"
-                      .format(len(skipped)))
+                if args.raw_only:
+                    print("    punya baris (raw tersimpan)      : {}"
+                          .format(len(loaded)))
+                    print("    tanpa baris (raw tanpa data)     : {}"
+                          .format(len(skipped)))
+                else:
+                    print("    punya baris (kemungkinan LOADED) : {}"
+                          .format(len(loaded)))
+                    print("    tanpa baris (kemungkinan SKIPPED): {}"
+                          .format(len(skipped)))
                 for sid in skipped:
-                    print("      - {} (SKIPPED, envelope tanpa baris)"
-                          .format(sid))
+                    if args.raw_only:
+                        print("      - {} (raw tanpa baris)".format(sid))
+                    else:
+                        print("      - {} (SKIPPED, envelope tanpa baris)"
+                              .format(sid))
             else:
                 print("  (peringatan) Tidak ada record di "
                       "raw.scholar_scrape_result untuk dosen yang OK.")

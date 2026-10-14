@@ -1,0 +1,151 @@
+================================================================
+STATUS KERJA — telkom-publication-dashboard
+================================================================
+Dibuat: 2026-10-09
+
+----------------------------------------------------------------
+1. PROYEK INI APA?
+----------------------------------------------------------------
+telkom-publication-dashboard = pipeline ETL yang mengambil data
+Google Scholar (profil dosen) lalu menyimpannya ke PostgreSQL
+dengan arsitektur 4 layer:
+
+  raw     -> envelope mentah hasil scraping (JSONB)
+  staging -> jejak audit nilai yang sudah dibersihkan
+  core    -> data final: authors, publications,
+             publication_authors, author_metrics,
+             publication_metrics
+  mart    -> (belum dipakai)
+
+Alur: scrape_scholar_playwright -> publications.py (mapper) ->
+postgres.py (loader).
+
+----------------------------------------------------------------
+2. KITA SEDANG NGAPAIN?
+----------------------------------------------------------------
+Kita sedang merevisi pipeline lama menjadi pipeline baru
+("revisi pipeline 4-layer"). Pipeline baru menambahkan:
+  - scraping halaman DETAIL publikasi (nama penulis lengkap)
+  - kebijakan 3j: halaman detail = sumber otoritatif
+    (DELETE ALL + tulis ulang publication_authors)
+  - tabel raw terstruktur (raw.scholar_publication / raw.scholar_author)
+  - tabel staging (stg_author, stg_publication)
+  - kolom baru di core.publications (publication_year, dll.)
+  - enrichment (backfill DOI/publisher via Crossref)
+
+Saat ini kita sedang mengerjakan 3 PERBAIKAN berurutan sesuai
+plan "revisi-pipeline-4-layer". Ketiganya sudah selesai dan
+dilaporkan.
+
+----------------------------------------------------------------
+3. STATUS 3 PERBAIKAN
+----------------------------------------------------------------
+[Perbaikan 1] backfill_crossref: gate tahun
+  Status : SELESAI
+  Isi    : backfill DOI/publisher via Crossref hanya diproses
+           kalau tahun publikasi valid (bukan 0/None).
+
+[Perbaikan 2] pindah query 07 backfill ke sql/maintenance/
+  Status : SELESAI
+  Isi    : query data-only dipindah dari sql/ddl/ ke
+           sql/maintenance/ (aturan C diperbarui). Dibuktikan
+           idempoten di publication_test.
+
+[Perbaikan 3] dua pertanyaan:
+  (a) publication_authors 50 -> 45 untuk profil 8kDg_v4AAAAJ
+  (b) arti "staging (kondisional profil)"
+  Status : SELESAI (laporan sudah diberikan)
+
+----------------------------------------------------------------
+4. HASIL PERBAIKAN 3a — KENAPA 50 -> 45?
+----------------------------------------------------------------
+Angka 50 -> 45 adalah NET -5, tapi sebenarnya ini REWRITE,
+bukan hapus 5 baris:
+  - 33 baris lama dihapus (nama pendek dari halaman daftar)
+  - 28 baris baru ditambahkan (nama lengkap dari halaman detail)
+  - 17 baris tetap sama (nama lengkap yang sudah benar)
+  - net = 50 - 33 + 28 = 45
+
+Net per publikasi (pub 41-50, profil 8kDg_v4AAAAJ):
+  pub 41: 6 -> 6  (net 0)     pub 42: 7 -> 6  (net -1)
+  pub 43: 6 -> 8  (net +2)    pub 44: 5 -> 4  (net -1)
+  pub 45: 3 -> 3  (net 0)     pub 46: 5 -> 4  (net -1)
+  pub 47: 5 -> 4  (net -1)    pub 48: 5 -> 4  (net -1)
+  pub 49: 4 -> 3  (net -1)    pub 50: 4 -> 3  (net -1)
+
+Penyebab:
+  1. Kebijakan 3j pipeline revisi: publikasi bersumber "detail"
+     dianggap otoritatif -> SEMUA tautan lama publication_authors
+     dihapus, lalu ditulis ulang dari daftar penulis halaman
+     detail (terjadi pada run 139/140/142, 2026-10-09).
+  2. Data lama (50 baris) = akumulasi pipeline lama (run 1-138,
+     2026-09-29 s.d. 10-06) + re-run dengan commit 1bdb67d
+     (2026-10-07) yang menambahkan _bentuk_pendek (substitusi
+     nama pendek pemilik profil -> nama lengkap, mis. "TAD
+     Kuntjoro" -> "Tri Agus Djoko Kuntjoro"). Komposisi:
+     32 nama pendek (author 68-89) + 18 nama lengkap
+     (67, 722, 811, 1343, 1816).
+  3. Data baru (45 baris) = nama lengkap dari halaman detail.
+     20 author baru (3297-3316) dibuat di load 1; author nama
+     lengkap yang sudah ada dipakai ulang.
+  4. Selisih jumlah per publikasi = beda daftar penulis halaman
+     detail vs akumulasi lama (halaman detail menampilkan
+     penulis lebih lengkap/berbeda dari halaman daftar).
+
+----------------------------------------------------------------
+5. HASIL PERBAIKAN 3b — "STAGING (KONDISIONAL PROFIL)"
+----------------------------------------------------------------
+load_core_rows(core, conn=None, run_id=None, profil=None):
+  blok staging (postgres.py baris 2152-2190) HANYA dijalankan
+  kalau parameter `profil` tidak None.
+
+  - `profil` dibangun oleh load_scholar_run (baris 2472-2482)
+    hanya kalau tahap raw mengembalikan result_id dan envelope
+    punya data: {result_id, scholar_id, nama, h_index, domain,
+    batches, elapsed}.
+  - Kalau profil None (mis. test_database.py memanggil
+    load_core_rows langsung tanpa envelope), penulisan staging
+    dilewati total; core tetap ditulis normal.
+  - Isi staging: stg_author (urutan 0) + stg_publication per
+    publikasi (authors_teks = nama penulis digabung ", " urut
+    author_order), ditulis dalam transaksi core yang sama.
+  - PENTING: staging BUKAN tahap antara. Tidak ada SELECT dari
+    staging di src/ (semua referensi ke STG_AUTHORS /
+    STG_PUBLICATIONS hanyalah INSERT). Core diisi langsung dari
+    dict hasil mapper (to_core_rows), bukan dari staging.
+
+----------------------------------------------------------------
+6. LINGKUNGAN & ATURAN PENTING
+----------------------------------------------------------------
+Dua database PostgreSQL (podman, container pubdash_postgres):
+  - publication_dashboard : data pipeline LAMA murni (run 1-138,
+    tanpa tabel/kolom revisi). Dipakai sebagai sumber "kondisi
+    sebelum" untuk perbandingan. JANGAN DIUBAH (hanya SELECT).
+  - publication_test     : clone publication_dashboard + run
+    revisi 139/140/142 + run verifikasi 143/144/145 (perbaikan
+    varian nama pemilik, publikasi 48). Tempat verifikasi
+    idempotensi.
+
+Aturan kerja:
+  A. Kode hanya setelah disetujui user.
+  B. Tidak ada perintah destruktif (DROP/TRUNCATE/DELETE tanpa
+     WHERE / podman compose down -v).
+  C. sql/ddl/01-03 tidak boleh diedit; query data-only di
+     sql/maintenance/ (saat ini: 07 backfill profile_author_id,
+     08 kandidat author duplikat - keduanya query manual, bukan
+     migrasi otomatis). Migrasi skema 04/05/06 tetap di
+     sql/ddl/ dan sinkron dengan definisi SQLAlchemy di
+     postgres.py.
+  D. Perubahan skema harus sinkron dengan definisi SQLAlchemy
+     di postgres.py.
+  E. run_batch.py dan test-nya off-limits (kecuali test_scraper
+     + test_transformation untuk perbaikan 1).
+  F. Komentar/docstring dalam Bahasa Indonesia.
+
+----------------------------------------------------------------
+7. LANGKAH BERIKUTNYA
+----------------------------------------------------------------
+Ketiga perbaikan sudah selesai dan dilaporkan. Menunggu arahan
+user: lanjut ke langkah plan berikutnya, atau ada koreksi dari
+laporan Perbaikan 3.
+================================================================
