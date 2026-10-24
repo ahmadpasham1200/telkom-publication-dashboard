@@ -430,13 +430,19 @@ def to_core_rows(raw, retrieved_at=None):
     Kunci di dalam tiap dict adalah nama kolom di DDL core, dengan
     nilai None untuk kolom yang belum bisa diisi pada tahap ini
     (lihat blok "CELAH YANG SENGAJA TIDAK DIPETAHKAN" di akhir
-    file). Pengecualiannya dua kunci di publication_authors:
-    `publication_index` dan `author_name`. Keduanya bukan kolom DB,
-    melainkan kunci handoff yang sengaja dikeluarkan supaya
-    pemanggil bisa menyambungkan baris ke publikasi yang tepat dan
-    bisa mencari atau membuat author dari nama yang ada.
+    file). Pengecualiannya satu kunci di publication_authors:
+    `publication_index`, yang bukan kolom DB, melainkan kunci
+    handoff yang sengaja dikeluarkan supaya pemanggil bisa
+    menyambungkan baris ke publikasi yang tepat.
 
-    Catatan: kolom SERIAL (authors.author_id, publications.publications_id,
+    publication_authors juga memuat `author_name` dan `author_type`.
+    Keduanya kini kolom NYATA di core.publication_authors, tapi
+    `author_name` tetap dipakai ganda sebagai kunci handoff untuk
+    resolusi author (cari atau buat author dari nama itu).
+    `author_type` bernilai 'penulis_pertama' untuk author_order 0,
+    selainnya 'co_author'.
+
+    Catatan: kolom SERIAL (authors.author_id, publications.publication_id,
     metric_id) tetap dikeluarkan sebagai kunci bernilai None, sama
     seperti kolom core lain, supaya bentuk hasil mapper seragam di
     kelima tabel. Nilainya memang baru ada setelah database memberi
@@ -458,7 +464,9 @@ def to_core_rows(raw, retrieved_at=None):
         "sinta_id": None,             # tidak ada di sumber Scholar
         "scholar_id": _rapikan_teks(raw.get("scholar_id")),
         "scopus_id": None,            # tidak ada di sumber Scholar
-        "program_study": None,        # tidak ada di sumber Scholar
+        "program_study": None,        # tidak ada di data scrape Scholar;
+                                      # diisi pemanggil (prodi profil
+                                      # pemilik, fill-only-when-NULL)
         "faculty": None,              # tidak ada di sumber Scholar
     }
 
@@ -471,7 +479,7 @@ def to_core_rows(raw, retrieved_at=None):
         # Satu-ke-satu dengan baris `rows`: publications[i] dipasangkan
         # dengan publication_metrics[i] dan publication_index = i.
         # Urutan BARU TIDAK diubah, sehingga pemanggil tidak perlu
-        # mencari publications_id berdasarkan isi.
+        # mencari publication_id berdasarkan isi.
         # Sumber penulis (keputusan 3j): halaman detail otoritatif
         # kalau detail_authors terisi; selain itu daftar halaman daftar.
         # author_source adalah kunci handoff (bukan kolom DB) yang
@@ -495,7 +503,7 @@ def to_core_rows(raw, retrieved_at=None):
                 pages = hasil_extra.pages
 
         publications.append({
-            "publications_id": _BELUM_ADA,   # SERIAL, diisi database
+            "publication_id": _BELUM_ADA,     # SERIAL, diisi database
             "title": _rapikan_teks(baris_pub.get("title")),
             # publication_year selalu dari tahun halaman daftar (scraper
             # sudah menyediakannya); fallback parse di sini untuk input
@@ -555,17 +563,24 @@ def to_core_rows(raw, retrieved_at=None):
                 # handoff ke pemanggil. Penanda posisi (0-based) di
                 # list hasil["publications"], dipakai untuk
                 # menyambungkan baris ini ke baris publikasi yang
-                # tepat setelah publications_id diberikan database.
+                # tepat setelah publication_id diberikan database.
                 "publication_index": indeks,
                 "publication_id": _BELUM_ADA,   # FK, diisi setelah load
-                "author_id": _BELUM_ADA,        # FK, diisi setelah load
-                # author_name: BUKAN kolom DB, tapi kunci handoff ke
-                # pemanggil. Dipakai sebagai kunci pencarian author di
-                # core.authors, dan kalau tidak ditemukan, sebagai
-                # nama untuk INSERT author baru. Sudah disepakati
-                # bahwa nama ini tidak perlu disimpan lagi di core
-                # karena aslinya sudah ada di lapisan raw.
+                "author_id": _BELUM_ADA,        # FK, diisi setelah load;
+                                                # NULL utk co-author tak dikenal
+                # author_name: kini kolom DB (core.publication_authors)
+                # sekaligus kunci handoff ke pemanggil. Dipakai sebagai
+                # kunci pencarian author di core.authors; kalau tidak
+                # ditemukan, nasibnya tergantung peran penulis: pemilik
+                # lewat resolve() bisa memicu INSERT author baru,
+                # co-author lewat cari() (cache-only) hanya menyimpan
+                # nama ini dengan author_id NULL - tanpa INSERT.
                 "author_name": nama,
+                # author_type: kolom DB baru. Kosakata sama dengan
+                # author_role di raw: penulis pertama (author_order 0)
+                # atau co_author untuk sisanya.
+                "author_type": "penulis_pertama" if urutan == 0
+                               else "co_author",
                 "author_order": urutan,
             })
 
@@ -602,43 +617,64 @@ def to_core_rows(raw, retrieved_at=None):
 #    elemen yang sama.
 #
 # 2) publication_authors: resolusi nama dipegang pemanggil
-#    author_id harus hasil resolusi author_name ke
-#    core.authors.author_id. author_name dan publication_index BUKAN
-#    kolom DB, tapi keduanya memang sengaja dihasilkan sebagai kunci
-#    handoff - bukan sisa yang menggantung.
+#    author_id BOLEH NULL - tidak lagi dijamin hasil resolusi
+#    author_name ke core.authors.author_id. Ada DUA JALUR resolusi,
+#    tergantung peran penulis dalam publikasi:
+#      - Pemilik/profil publication: resolver.resolve() - cocok
+#        persis (casefold), auto-create author bila belum ada,
+#        termasuk pencatatan scholar_id dan pengisian program_study
+#        dari profil (fill-only-when-NULL, lihat
+#        _stmt_isi_program_study_author).
+#      - Co-author dalam daftar penulis: resolver.cari() CACHE-ONLY
+#        - nama yang tidak dikenal menghasilkan author_id NULL;
+#        baris tautan tetap ditulis dengan author_name tersimpan,
+#        TANPA membuat baris author tiruan di core.authors
+#        (kebijakan migrasi 14).
+#    author_name (kini juga kolom DB) dan publication_index tetap
+#    dihasilkan sebagai kunci handoff di samping fungsinya sebagai
+#    kolom - bukan sisa yang menggantung.
 #
 #    Pemanggil diharapkan melakukan, minimal:
-#      a) INSERT publications, lalu catat publications_id yang
+#      a) INSERT publications, lalu catat publication_id yang
 #         dikembalikan per indeks. Karena urutan INSERT sama dengan
-#         urutan list, publications_id untuk indeks i = hasil ke-i.
-#      b) Untuk tiap baris publication_authors, cari author_name di
-#         core.authors dengan pencocokan PERSIS, TIDAK membedakan
-#         huruf besar-kecil.
-#           - ditemukan    -> pakai author_id yang sudah ada.
-#           - tidak ditemukan -> INSERT author baru yang HANYA kolom
-#             name terisi, lalu pakai author_id hasil INSERT itu.
+#         urutan list, publication_id untuk indeks i = hasil ke-i.
+#      b) Resolusi nama memakai AuthorResolver: pemilik profil lewat
+#         resolve() (auto-create bila belum ada, sebelum tautan
+#         diproses); tiap baris publication_authors lewat cari()
+#         (cache-only). Nama yang tidak dikenal di jalur cari()
+#         -> author_id NULL, tanpa INSERT author baru.
 #      c) INSERT publication_authors dengan publication_id dari (a)
-#         dan author_id dari (b). author_order dipakai apa adanya,
-#         tidak diurutkan ulang.
+#         dan author_id dari (b) yang BOLEH NULL. Identitas baris
+#         kini adalah UNIQUE (publication_id, author_order) - itu
+#         yang jadi target ON CONFLICT; PK baris =
+#         publication_author_id (surrogate, migrasi 14), bukan lagi
+#         tripel (publication_id, author_id, author_order).
+#         author_order dan author_type dipakai apa adanya, tidak
+#         dihitung ulang.
 #
 #    OTORITA AUTO-CREATE AUTHOR
-#    Membuat author baru hanya mengisi kolom name. Kolom sinta_id,
-#    scopus_id, program_study, dan faculty TIDAK diisi - bukan karena
-#    lupa, tapi karena tidak ada sumbernya dan DDL sengaja tidak
-#    diubah untuk accommodate apa pun. Baris author yang dibuat lewat
-#    jalur ini akan terlihat minim isinya di core; itu yang disepakati.
+#    Auto-create kini hanya terjadi lewat jalur pemilik profil
+#    (resolver.resolve()): baris author baru mengisi name,
+#    scholar_id (bila ada), dan program_study dari profil -
+#    program_study fill-only-when-NULL (COALESCE, tidak menimpa
+#    nilai lama). Kolom sinta_id, scopus_id, dan faculty TIDAK
+#    diisi - bukan karena lupa, tapi karena tidak ada sumbernya dan
+#    DDL sengaja tidak diubah untuk accommodate apa pun. Baris
+#    author yang dibuat lewat jalur ini akan terlihat minim isinya
+#    di core; itu yang disepakati. Co-author TIDAK PERNAH memicu
+#    auto-create - lihat jalur cari() di atas.
 #
-#    Nama mentah dari Scholar dianggap sudah tersimpan di lapisan raw,
-#    sehingga tidak wajib dipertahankan lagi di core setelah
-#    author_id terbentuk. Karena itu tidak ada kolom baru yang
-#    diperlukan untuk menampungnya di sini.
+#    Nama mentah dari Scholar kini disimpan juga di
+#    core.publication_authors.author_name sebagai kolom, sekaligus
+#    tetap tersedia di lapisan raw. Nilai di core adalah nama hasil
+#    pemecahan daftar penulis (bukan teks mentah profil), jadi
+#    raw tetap satu-satunya sumber nama profil yang asli.
 #
-#    CATATAN PENTING: uraian di atas adalah KONTRAK yang sudah
-#    diputuskan, bukan fakta bahwa loader sudah jalan. Di akhir file
-#    ini ditulis bahwa loading/postgres.py masih berupa TODO; belum
-#    ada implementasi maupun pengujian atas kebijakan ini. Yang
-#    dijamin mapper hanya isi publication_authors, bukan hasil
-#    resolusinya.
+#    STATUS (dikoreksi): kebijakan di atas bukan lagi sekadar
+#    kontrak tanpa implementasi - loader di loading/postgres.py
+#    (load_core_rows) sudah menjalankannya penuh dan diuji di
+#    tests/test_database.py. Yang dijamin mapper hanya isi
+#    publication_authors, bukan hasil resolusinya.
 #
 # 3) authors.author_id juga belum ada
 #    author_metrics.author_id diisi setelah authors di-INSERT; kedua
@@ -664,8 +700,14 @@ def to_core_rows(raw, retrieved_at=None):
 # - Pencocokan: nama PERSIS, TIDAK membedakan huruf besar-kecil.
 #   Sederhana dengan sengaja, supaya tidak butuh data tambahan apa
 #   pun untuk berjalan.
-# - Auto-create: nama yang tidak ditemukan memicu INSERT author baru
-#   dengan kolom name saja (lihat blok CATATAN di atas).
+# - Auto-create: HANYA terjadi lewat resolve() untuk pemilik profil.
+#   Nama pemilik yang tidak ditemukan memicu INSERT author baru yang
+#   kini mengisi name, scholar_id (bila ada), dan program_study dari
+#   profil (fill-only-when-NULL) - bukan lagi "kolom name saja";
+#   sinta_id, scopus_id, dan faculty tetap tidak diisi. Nama yang
+#   tidak ditemukan di jalur co-author TIDAK memicu INSERT:
+#   resolver.cari() cache-only -> author_id NULL, nama tetap
+#   tersimpan di baris tautan (lihat blok CATATAN di atas).
 #
 # Risiko duplikat author DITERIMA untuk sekarang, bukan diabaikan.
 # Dua hal penyebabnya, dan keduanya adalah alasan penyempurnaan
@@ -712,25 +754,29 @@ def to_core_rows(raw, retrieved_at=None):
 # - authors.sinta_id / scopus_id / program_study / faculty
 #     Semuanya atribut institutional, bukan atribut indeks sitasi.
 #     Google Scholar tidak memuatnya. Harus berasal dari sistem
-#     internal. Berkaitan dengan auto-create author: kolom-kolom ini
-#     juga TIDAK diisi pada author yang dibuat otomatis, dan itu
-#     disengaja.
+#     internal. Berkaitan dengan auto-create author: program_study
+#     kini diisi pemanggil dari profil pemilik (fill-only-when-NULL,
+#     lihat _stmt_isi_program_study_author), jadi hanya gap di tahap
+#     mapper; sinta_id, scopus_id, dan faculty tetap TIDAK diisi pada
+#     author yang dibuat otomatis, dan itu disengaja.
 #
 # - authors.name ketika None
 #     Kolomnya NOT NULL, jadi mapper mengembalikan None dan
 #     menyerahkan keputusan pada pemanggil. Menebak nama dari
 #     publication_authors akan menghasilkan author palsu.
 #
-# - publication_authors.author_name dan publication_index
-#     SUDAH SELESAI, bukan gap lagi. Keduanya tetap dipetakan walau
-#     bukan kolom DB karena memang sengaja dihasilkan sebagai kunci
-#     handoff ke pemanggil: author_name untuk mencari author, atau
-#     menjadi nama saat INSERT author baru; publication_index untuk
-#     menyambungkan baris itu ke publikasi yang tepat. Nama tidak
-#     perlu disimpan lagi di core karena aslinya sudah ada di lapisan
-#     raw. Lihat blok CATATAN dan KEBIJAKAN di atas.
+# - publication_authors.author_name, author_type, dan publication_index
+#     SUDAH SELESAI, bukan gap lagi. author_name dan author_type kini
+#     kolom DB di core.publication_authors, tapi author_name tetap
+#     dihasilkan ganda sebagai kunci handoff ke pemanggil: untuk
+#     mencari author, lalu menjadi nama yang disimpan saat co-author
+#     tak dikenal (author_id NULL) - tanpa INSERT - atau bahan
+#     resolve() untuk pemilik.
+#     publication_index tetap bukan kolom DB - penanda handoff untuk
+#     menyambungkan baris itu ke publikasi yang tepat. Lihat blok
+#     CATATAN dan KEBIJAKAN di atas.
 #
-# - metric_id, authors.author_id, publications.publications_id,
+# - metric_id, authors.author_id, publications.publication_id,
 #   publication_authors.publication_id, publication_authors.author_id,
 #   author_metrics.author_id, publication_metrics.publication_id
 #     Semuanya SERIAL/FK. Tidak mungkin ada sebelum INSERT, jadi

@@ -91,7 +91,7 @@ bagian-bagian yang ditandai di bawah)
        (title, publication_year) dengan NULLS NOT DISTINCT
        (sql/ddl/06) dan core.authors di-upsert pada
        lower(btrim(name)), keduanya dengan RETURNING id yang sudah
-       ada, jadi publications_id / author_id TIDAK berubah dan
+       ada, jadi publication_id / author_id TIDAK berubah dan
        relasi di tabel lain tidak rusak. Kolom non-kunci publikasi
        memakai "nilai non-NULL terakhir menang" via COALESCE
        (kecuali journal yang menang apa adanya), dan
@@ -107,21 +107,29 @@ bagian-bagian yang ditandai di bawah)
 
 Kebijakan yang disepakati (lihat bagian RESOLUSI PENULIS)
 ---------------------------------------------------------
-    1. Nama penulis yang tidak ada di core.authors akan
-       otomatis dibuat dengan HANYA kolom `name`. Kolom
-       sinta_id / scopus_id / program_study / faculty
-       dibiarkan NULL dan TIDAK ada kolom baru yang
-       ditambahkan ke DDL. Nama mentah aslinya sudah
-       tersimpan di lapisan raw.
+    1. Yang dibuat di core.authors HANYA author pemilik profil
+        (dengan `name`, dan - KHUSUS pemilik - program_study dari
+        Excel referensi (baris_referensi) yang lolos gerbang
+        verifikasi; lihat prodi_pemilik di
+        src/loading/author_records.py). Prodi itu juga disimpan untuk
+        pemilik yang SUDAH ada di tabel (UPDATE isi-saat-NULL, lihat
+        _stmt_isi_program_study_author). Co-author yang tidak dikenal
+        TIDAK dibuat lagi (migrasi 14): tautannya disimpan dengan
+        author_id NULL + author_name, supaya tidak ada baris author
+        tiruan. Kolom sinta_id / scopus_id / faculty dibiarkan NULL
+        dan TIDAK ada kolom baru yang ditambahkan ke DDL. Nama mentah
+        aslinya sudah tersimpan di lapisan raw.
     2. Pencocokan nama: PERSIS, tidak membedakan huruf
-       besar/kecil (case-insensitive). Risiko dua orang berbeda
-       dengan nama sama dianggap satu author diabaikan untuk
-       sekarang; pencocokan dengan daftar faculty resmi
-       ditunda ke tahap berikutnya.
+        besar/kecil (case-insensitive). Risiko dua orang berbeda
+        dengan nama sama dianggap satu author diabaikan untuk
+        sekarang; pencocokan dengan daftar faculty resmi
+        ditunda ke tahap berikutnya.
     3. Satu author yang sama dipakai ulang di semua publikasi
-       dalam satu run DAN di run-run berikutnya: cache
-       nama -> author_id diisi satu kali dari tabel yang ada,
-       lalu diperbarui setiap kali ada INSERT baru.
+        dalam satu run DAN di run-run berikutnya: cache
+        nama -> author_id diisi satu kali dari tabel yang ada,
+        lalu diperbarui setiap kali ada INSERT baru. Untuk tautan,
+        cache hanya DIBACA (resolver.cari) - tidak pernah menulis
+        (migrasi 14).
 
 Yang SENGAJA tidak dikerjakan
 -----------------------------
@@ -131,16 +139,21 @@ Yang SENGAJA tidak dikerjakan
       UPSERT. Yang dijamin batasan UNIQUE + ON CONFLICT: tidak
       akan ada baris kembar, hanya "run terakhir menang".
     - authors.scholar_id tidak pernah ditimpa dengan NULL
-      (lihat kebijakan UPSERT di atas) dan kolom institutional
-      lain (sinta_id / scopus_id / program_study / faculty)
-      tidak pernah diisi di sini sama sekali.
+      (lihat kebijakan UPSERT di atas). Kolom institutional
+      sinta_id / scopus_id / faculty tidak pernah diisi di sini
+      sama sekali; program_study hanya terisi untuk pemilik
+      profil dari Excel referensi - baik lewat UPSERT saat
+      pembuatan baris maupun lewat UPDATE isi-saat-NULL untuk
+      baris yang sudah ada - dan keduanya dijaga COALESCE
+      supaya NULL baru tidak menghapus nilai lama.
     - publication_authors memakai kebijakan 3j (PERUBAHAN dari
       "tidak pernah dihapus"): publikasi bersumber 'detail'
       dihapus-tulis-ulang (delete-and-rewrite), sedangkan
       publikasi bersumber 'list' yang sudah punya relasi dilewati
       supaya data detail tidak diturunkan ke daftar terpotong.
       Tautan lain di-INSERT dengan toleransi duplikat (ON CONFLICT
-      DO NOTHING).
+      DO NOTHING pada unique (publication_id, author_order) -
+      migrasi 14).
     - Tidak ada pemrosesan ulang (replay) dari raw ke core.
       Tabel raw ditulis supaya data tidak hilang, belum
       supaya ada perintah untuk memuat ulang.
@@ -264,7 +277,7 @@ AUTHORS = sa.Table(
 PUBLICATIONS = sa.Table(
     "publications",
     _META,
-    sa.Column("publications_id", sa.Integer, primary_key=True,
+    sa.Column("publication_id", sa.Integer, primary_key=True,
               autoincrement=True),
     sa.Column("title", sa.Text, nullable=False),
     sa.Column("publication_year", sa.Integer),
@@ -292,9 +305,27 @@ PUBLICATIONS = sa.Table(
 PUBLICATION_AUTHORS = sa.Table(
     "publication_authors",
     _META,
-    sa.Column("publication_id", sa.Integer, primary_key=True, nullable=False),
-    sa.Column("author_id", sa.Integer, primary_key=True, nullable=False),
-    sa.Column("author_order", sa.Integer, primary_key=True, nullable=False),
+    # PK surrogate (migrasi 14): identitas baris kini publication_author_id,
+    # bukan tripel lama. author_id nullable - co-author yang TIDAK
+    # dikenal di core.authors disimpan sebagai author_id NULL +
+    # author_name, TANPA membuat baris author tiruan (kebijakan
+    # resolusi cache-only, lihat load_core_rows).
+    sa.Column("publication_author_id", sa.Integer, primary_key=True,
+              autoincrement=True),
+    sa.Column("publication_id", sa.Integer, nullable=False),
+    sa.Column("author_id", sa.Integer, nullable=True),
+    sa.Column("author_order", sa.Integer, nullable=False),
+    # Nama penulis APA ADANYA dan perannya (penulis_pertama/co_author)
+    # sesuai daftar sumber - bukan hasil resolusi nama ke author_id.
+    # Nullable: baris lama (sebelum kolom ini ada) tetap sah.
+    sa.Column("author_name", sa.Text),
+    sa.Column("author_type", sa.Text),
+    # Identitas per-posisi (migrasi 14): satu publikasi hanya boleh
+    # punya satu tautan per urutan. Inilah target ON CONFLICT di
+    # _stmt_sisip_publication_authors - bukan lagi tripel dengan
+    # author_id (yang sekarang bisa NULL, dan NULL tidak bisa jadi
+    # bagian key unik).
+    sa.UniqueConstraint("publication_id", "author_order"),
     schema="core",
 )
 
@@ -689,10 +720,11 @@ def _bentuk_pendek(pendek, lengkap):
     keduanya - hasilnya author tiruan tercipta dan baris pemilik
     kehilangan seluruh relasinya. Fungsi ini dipakai PEMANGGIL
     (loop publication_authors di load_core_rows) untuk menerjemahkan
-    bentuk pendek ke nama lengkap SEBELUM resolve(); resolver,
-    cache-nya, dan mapper tidak diubah sama sekali (kontraknya ada
-    di transformation/publications.py: kebijakan pencocokan author
-    milik pemanggil).
+    bentuk pendek ke nama lengkap SEBELUM nama dicari di cache
+    resolver (cari(); sejak migrasi 14 tautan tidak lagi memanggil
+    resolve()); resolver, cache-nya, dan mapper tidak diubah sama
+    sekali (kontraknya ada di transformation/publications.py:
+    kebijakan pencocokan author milik pemanggil).
 
     Syaratnya ketat - SEMUA harus terpenuhi:
 
@@ -1165,7 +1197,8 @@ def connect(dotenv_path=None, url=None, echo=False):
 # menyediakan dua method:
 #
 #     daftar_author()                    -> iterable (author_id, name)
-#     buat_author(nama, scholar_id=None) -> author_id
+#     buat_author(nama, scholar_id=None,
+#                 program_study=None)    -> author_id
 #
 # PostgresAuthorStore adalah implementasi sungguhan; test memakai
 # store palsu. Resolver sendiri tidak tahu-menahu soal SQL, dan
@@ -1250,12 +1283,27 @@ class AuthorResolver:
             return None
         return self._cache.get(kunci)
 
-    def resolve(self, nama, scholar_id=None):
+    def resolve(self, nama, scholar_id=None, program_study=None):
         """Kembalikan author_id untuk `nama`, membuatnya bila belum ada.
 
+        Sejak migrasi 14, satu-satunya pemanggil resolve() di
+        load_core_rows adalah tahap author PEMILIK profil; tautan
+        co-author memakai cari() (cache-only) dan author_id NULL
+        bila tidak dikenal, jadi resolve() ini praktis hanya
+        "buat pemilik bila belum ada".
+
         `scholar_id` hanya diisi untuk baris author pemilik profil.
-        Nama co-author yang dibuat otomatis mendapat scholar_id NULL,
-        sesuai kebijakan yang disepakati.
+        Nama yang dibuat otomatis mendapat scholar_id NULL bila
+        tidak disebut, sesuai kebijakan yang disepakati.
+
+        `program_study` juga hanya diisi untuk author pemilik profil
+        (nilai prodi Excel referensi yang lolos gerbang verifikasi);
+        NULL tidak menimpa nilai lama - lihat
+        COALESCE di _stmt_buat_author. PENTING: pada cache hit nama
+        sudah ada, resolver TIDAK menulis apa pun (kedua parameter
+        diabaikan); pemanggil yang memastikan prodi tetap sampai
+        dengan UPDATE terpisah - lihat _stmt_isi_program_study_author
+        yang dipakai load_core_rows.
 
         Nama None/kosong adalah pelanggaran kontrak (bukan kondisi
         data yang wajar), jadi lempar LoaderError, bukan diam-diam
@@ -1275,7 +1323,8 @@ class AuthorResolver:
             self.dipakai_ulang += 1
             return author_id
 
-        author_id = self._store.buat_author(bersih, scholar_id=scholar_id)
+        author_id = self._store.buat_author(
+            bersih, scholar_id=scholar_id, program_study=program_study)
         if author_id is None:
             raise LoaderError(
                 "INSERT INTO core.authors untuk nama '{}' tidak "
@@ -1305,16 +1354,18 @@ class PostgresAuthorStore:
         """SELECT author_id, name FROM core.authors (sekali, saat mulai)."""
         return self._conn.execute(_stmt_daftar_author()).all()
 
-    def buat_author(self, nama, scholar_id=None):
+    def buat_author(self, nama, scholar_id=None, program_study=None):
         """UPSERT satu baris core.authors, kembalikan author_id.
 
-        Yang ditulis hanya `name` dan `scholar_id`. scholar_id
-        NULL berarti kolom itu tetap kosong, sama saja dengan tidak
-        disebut sama sekali - dan tidak akan menimpa scholar_id
-        yang sudah terisi (lihat _stmt_buat_author). Kolom
-        sinta_id / scopus_id / program_study / faculty tidak
-        pernah diisi di sini: itu atribut institutional, bukan
-        hasil scraping.
+        Yang ditulis hanya `name`, `scholar_id`, dan `program_study`.
+        scholar_id NULL berarti kolom itu tetap kosong, sama saja
+        dengan tidak disebut sama sekali - dan tidak akan menimpa
+        scholar_id yang sudah terisi (lihat _stmt_buat_author).
+        program_study hanya diisi pemilik profil dari Excel
+        referensi; NULL-nya juga dijaga COALESCE supaya tidak
+        menghapus nilai lama. Kolom sinta_id / scopus_id / faculty
+        tidak pernah diisi di sini: itu atribut institutional yang
+        belum punya sumber data.
 
         Kembalikan author_id apa adanya, baik untuk baris yang
         baru dibuat maupun untuk baris yang sudah ada dan
@@ -1322,7 +1373,8 @@ class PostgresAuthorStore:
         bisa - membedakan keduanya, dan memang tidak perlu:
         yang dia butuhkan hanya "author_id untuk nama ini".
         """
-        hasil = self._conn.execute(_stmt_buat_author(nama, scholar_id))
+        hasil = self._conn.execute(_stmt_buat_author(
+            nama, scholar_id, program_study))
         return hasil.scalar_one()
 
 
@@ -1596,7 +1648,7 @@ def _stmt_daftar_author():
     return sa.select(AUTHORS.c.author_id, AUTHORS.c.name)
 
 
-def _stmt_buat_author(nama, scholar_id=None):
+def _stmt_buat_author(nama, scholar_id=None, program_study=None):
     """INSERT ... ON CONFLICT INTO core.authors, RETURNING author_id.
 
     Upsert, bukan INSERT biasa: scraper yang dijalankan dua kali
@@ -1639,18 +1691,38 @@ def _stmt_buat_author(nama, scholar_id=None):
     scholar_id-nya NULL. Menimpa kolom yang sudah terisi dengan
     NULL berarti menghapus satu-satunya bukti bahwa author ini
     punya profil Scholar;
-    (c) atribut institutional lain (sinta_id, scopus_id,
-    program_study, faculty) tidak pernah terisi lewat jalur ini,
-    jadi scholar_id adalah satu-satunya identitas eksternal
-    yang bisa didapat di sini.
+    (c) sinta_id / scopus_id / faculty tidak pernah terisi lewat
+    jalur ini (belum ada sumber data), jadi scholar_id adalah
+    satu-satunya identitas eksternal yang bisa didapat di sini.
+
+    SET program_study = COALESCE(EXCLUDED.program_study, core.authors.program_study)
+    -------------------------------------------------------------------------
+    Pola yang sama dengan scholar_id, untuk alasan yang sama:
+    program_study hanya diisi untuk author PEMILIK PROFIL dari
+    Excel referensi (baris_referensi, lolos gerbang verifikasi
+    prodi_pemilik). Author yang sama bisa muncul di run lain
+    tanpa referensi (None) - NULL baru tidak boleh menghapus
+    prodi yang sudah tercatat. faculty / sinta_id / scopus_id
+    TIDAK ikut ditulis: tidak ada sumbernya, jadi jangan ditebak.
+
+    CATATAN: jalur UPSERT ini hanya menulis program_study ketika
+    resolver SEKALIUS membuat baris (atau kena konflik). Kalau
+    pemilik sudah ada di cache resolver (cache hit), statement ini
+    tidak dieksekusi sama sekali - karena itu load_core_rows
+    melengkapi dengan UPDATE terpisah
+    (_stmt_isi_program_study_author) yang COALESCE-nya mengisi
+    hanya saat NULL. Keduanya seragam dipanggil supaya prodi
+    Excel selalu sampai, apa pun keadaan baris pemilik.
 
     POLA yang dipakai di file ini: kolom yang isinya memang
     boleh NULL di sumber (journal, doi, publisher, ...)
     ditulis ulang apa adanya, karena NULL menimpa NULL tidak
-    menghapus informasi apa pun. Kolom identitas (scholar_id)
-    dijaga, karena NULL menimpa nilai berarti menghapus bukti.
+    menghapus informasi apa pun. Kolom identitas (scholar_id,
+    program_study) dijaga, karena NULL menimpa nilai berarti
+    menghapus bukti.
     """
-    stmt = pg.insert(AUTHORS).values(name=nama, scholar_id=scholar_id)
+    stmt = pg.insert(AUTHORS).values(
+        name=nama, scholar_id=scholar_id, program_study=program_study)
     return stmt.on_conflict_do_update(
         # Kunci case-insensitive: harus sama persis dengan
         # ekspresi indeks uq_authors_name_normalized.
@@ -1659,12 +1731,51 @@ def _stmt_buat_author(nama, scholar_id=None):
             "scholar_id": sa.func.coalesce(
                 stmt.excluded.scholar_id, AUTHORS.c.scholar_id
             ),
+            "program_study": sa.func.coalesce(
+                stmt.excluded.program_study, AUTHORS.c.program_study
+            ),
         },
     ).returning(AUTHORS.c.author_id)
 
 
+def _stmt_isi_program_study_author(author_id, program_study):
+    """UPDATE core.authors SET program_study isi-saat-NULL WHERE author_id.
+
+    Pelengkap _stmt_buat_author untuk satu kasus yang tidak
+    dicakupinya: author pemilik profil yang SUDAH ADA di cache
+    resolver (barisnya sudah ada di core.authors sejak awal run).
+    Resolver tidak memanggil buat_author() sama sekali pada cache
+    hit, jadi UPSERT di atas tidak pernah dieksekusi dan prodi
+    Excel referensi tidak pernah sampai ke database - padahal di
+    production pemilik hampir selalu sudah ada. Tanpa UPDATE ini,
+    pemetaan program_study jadi no-op untuk hampir semua run.
+
+    COALESCE(core.authors.program_study, :program_study)
+    ----------------------------------------------------
+    Arah coalesce-nya DIBALIK dari pola EXCLUDED di
+    _stmt_buat_author, dan itu disengaja: di sini nilai "baru"
+    adalah literal, bukan EXCLUDED, dan aturannya tetap sama -
+    isi hanya kalau sekarang NULL, jangan pernah menimpa nilai
+    yang sudah terisi. Untuk pemilik yang BARU saja dibuat lewat
+    UPSERT, kolomnya sudah non-NULL, jadi UPDATE ini murni no-op
+    - dipanggil seragam untuk kedua jalur supaya tidak ada
+    cabang khusus yang mudah salah.
+
+    Nilai `program_study` None TIDAK BOLEH dikirim ke statement
+    ini: coalesce(NULL-lama, NULL-baru) tetap NULL, tapi lebih
+    jujur kalau kasus "tidak ada prodi" ditangani di pemanggil
+    (jangan eksekusi sama sekali) daripada mengirim UPDATE yang
+    tidak mengubah apa pun. Lihat load_core_rows.
+    """
+    return sa.update(AUTHORS).where(
+        AUTHORS.c.author_id == author_id
+    ).values(
+        program_study=sa.func.coalesce(AUTHORS.c.program_study, program_study)
+    )
+
+
 def _stmt_sisip_publikasi(baris):
-    """INSERT ... ON CONFLICT INTO core.publications, RETURNING publications_id.
+    """INSERT ... ON CONFLICT INTO core.publications, RETURNING publication_id.
 
     publication_date dikonversi ke date karena kolomnya DATE.
 
@@ -1674,7 +1785,7 @@ def _stmt_sisip_publikasi(baris):
     (mis. "in press") akan lolos sebagai "berbeda" dan tidak pernah
     terdeteksi duplikat.
 
-    DO UPDATE TIDAK menyentuh publications_id, jadi id yang
+    DO UPDATE TIDAK menyentuh publication_id, jadi id yang
     dikembalikan pada kasus konflik adalah id yang sudah
     dipakai publication_authors dan publication_metrics dari
     run sebelumnya. Di sinilah nilai RETURNING itu menentukan:
@@ -1717,16 +1828,21 @@ def _stmt_sisip_publikasi(baris):
     return stmt.on_conflict_do_update(
         index_elements=["title", "publication_year"],
         set_=set_,
-    ).returning(PUBLICATIONS.c.publications_id)
+    ).returning(PUBLICATIONS.c.publication_id)
 
 
-def _stmt_sisip_publication_authors(publication_id, author_id, author_order):
+def _stmt_sisip_publication_authors(publication_id, author_id, author_order,
+                                    author_name=None, author_type=None):
     """INSERT INTO core.publication_authors ... ON CONFLICT DO NOTHING.
 
-    Ketiganya composite primary key. Tanpa ON CONFLICT, satu baris
-    kembar akan menggagalkan SELURUH run (violasi PK tidak bisa
-    di-rollback sebagian), padahal kasus itu nyata dan berasal dari
-    pipeline sendiri:
+    PK baris kini surrogate (publication_author_id, migrasi 14); yang
+    menjaga identitas adalah unique (publication_id, author_order),
+    dan itulah target ON CONFLICT. author_id nullable: co-author yang
+    tidak dikenal disimpan NULL (dengan author_name) tanpa membuat
+    author tiruan, jadi author_id TIDAK bisa lagi jadi bagian kunci.
+    Tanpa ON CONFLICT, satu baris kembar akan menggagalkan SELURUH
+    run (violasi unique tidak bisa di-rollback sebagian), padahal
+    kasus itu nyata dan berasal dari pipeline sendiri:
 
       - Scraper meniadakan duplikat baris publikasi berdasarkan
         judul MENTAH (lihat _collect_rows).
@@ -1735,42 +1851,53 @@ def _stmt_sisip_publication_authors(publication_id, author_id, author_order):
       - Jadi dua judul mentah berbeda yang hanya beda spasi ganda,
         newline, atau spasi di akhir bisa menjadi string title yang
         PERSIS SAMA, lalu keduanya menabrak natural key yang sama
-        pada UPSERT di atas dan menyatu jadi satu publications_id.
+        pada UPSERT di atas dan menyatu jadi satu publication_id.
       - publication_authors untuk keduanya lalu punya pasangan
-        (publication_id, author_id, author_order) yang sama persis
-        untuk penulis pertama - PK-nya bentrok.
+        (publication_id, author_order) yang sama persis untuk
+        penulis pertama - uniknya bentrok.
 
     DO NOTHING membuat load ini idempoten, bukan crash. Yang
     hilang bukan data, cuma pengulangan atas relasi yang sudah
-    tercatat.
+    tercatat. Baris lama TIDAK ditulis ulang sama sekali:
+    author_id / author_name / author_type yang sudah ada
+    dipertahankan.
 
     author_order sendiri tetap aman: satu nama yang muncul dua
     kali dalam daftar penulis punya order berbeda, jadi dua
     barisnya memang berbeda.
+
+    author_name dan author_type adalah kolom non-kunci (nullable)
+    yang menyalin nilai mapper apa adanya: nama penulis sesuai
+    sumber dan perannya (penulis_pertama untuk urutan 0, sisanya
+    co_author - kosakata sama dengan author_role di
+    raw.scholar_publication_author).
     """
     return pg.insert(PUBLICATION_AUTHORS).values(
         publication_id=publication_id,
         author_id=author_id,
         author_order=author_order,
+        author_name=author_name,
+        author_type=author_type,
     ).on_conflict_do_nothing(
-        # composite PK: publication_id, author_id, author_order
-        index_elements=["publication_id", "author_id", "author_order"],
+        # unique (publication_id, author_order) - migrasi 14; bukan
+        # lagi tripel (publication_id, author_id, author_order).
+        index_elements=["publication_id", "author_order"],
     )
 
 
-def _stmt_hapus_tautan(publication_id, author_id, author_order):
+def _stmt_hapus_tautan(publication_id, author_order):
     """DELETE FROM core.publication_authors untuk tautan spesifik.
 
-    Hanya menghapus baris (publication_id, author_id, author_order)
-    yang SEDANG diproses saat ini. Dipakai saat nama bentuk pendek
-    pemilik terlanjur menempel di author tiruan dari run sebelum fix:
-    tautan lama dibuang, lalu tautan baru disisipkan ke author_id
-    pemilik. Tidak ada DELETE terhadap core.authors, dan tidak ada
-    perubahan ke publikasi lain.
+    Hanya menghapus baris (publication_id, author_order) yang SEDANG
+    diproses saat ini - identitas baris kini pasangan itu saja
+    (migrasi 14; author_id tidak lagi bagian identitas karena bisa
+    NULL). Dipakai saat nama bentuk pendek pemilik terlanjur menempel
+    di author lain dari run sebelum fix: tautan lama dibuang, lalu
+    tautan baru disisipkan ke author_id pemilik. Tidak ada DELETE
+    terhadap core.authors, dan tidak ada perubahan ke publikasi lain.
     """
     return sa.delete(PUBLICATION_AUTHORS).where(
         PUBLICATION_AUTHORS.c.publication_id == publication_id,
-        PUBLICATION_AUTHORS.c.author_id == author_id,
         PUBLICATION_AUTHORS.c.author_order == author_order,
     )
 
@@ -1810,7 +1937,13 @@ def _stmt_author_yatim():
     Kandidat author yatim: tidak punya relasi di
     core.publication_authors, tidak punya baris di
     core.author_metrics, dan scholar_id-nya NULL (bukan pemilik
-    profil). INI HANYA QUERY SELECT, BUKAN DELETE: pembersihan
+    profil). Sejak migrasi 14 author_id di publication_authors bisa
+    NULL (co-author tidak dikenal); baris dengan author_id NULL tidak
+    PERNAH cocok dengan EXISTS di bawah (NULL != author_id apa pun),
+    jadi tautan semacam itu tidak menutupi author lain - author yang
+    hanya dirujuk oleh tautan NULL tetap terhitung yatim, yang memang
+    benar karena tautan itu tidak menunjuk author mana pun.
+    INI HANYA QUERY SELECT, BUKAN DELETE: pembersihan
     diputuskan user nanti (rencana 3e), bukan dijalankan otomatis
     oleh loader.
     """
@@ -1941,6 +2074,8 @@ def _pastikan_judul(judul, indeks, run_id):
 #                 load_core_rows() yang dipanggil langsung)
 #   author_id     author_id pemilik profil setelah dimuat
 #   authors_created   jumlah baris core.authors yang di-INSERT oleh run ini
+#                     (sejak migrasi 14 praktis hanya pemilik profil -
+#                     tautan co-author tidak lagi membuat author baru)
 #   authors_reused    jumlah resolusi nama yang memakai author yang sudah ada
 #   publications_inserted        jumlah baris core.publications yang di-INSERT
 #   publication_authors_inserted  jumlah baris core.publication_authors
@@ -1970,7 +2105,11 @@ def _pastikan_judul(judul, indeks, run_id):
 #     kedua untuk profil yang sama, sebagian besar bisa jadi
 #     UPDATE (ON CONFLICT DO UPDATE), bukan INSERT baru.
 #   - authors_created = resolver.dibuat, yaitu jumlah nama yang
-#     TIDAK ada di cache. Cache diisi ulang dari core.authors di
+#     TIDAK ada di cache. Sejak migrasi 14 ini praktis hanya
+#     menghitung pembuatan author PEMILIK profil, karena tautan
+#     co-author tidak lagi memanggil resolve() - mereka memakai
+#     cari() (cache-only) dan author_id NULL bila tidak dikenal.
+#     Cache diisi ulang dari core.authors di
 #     awal run, jadi dalam run yang normal ini sama dengan
 #     "jumlah baris author yang benar-benar baru". Kalau dua
 #     writer jalan bersamaan, satu bisa saja melakukan INSERT
@@ -1983,8 +2122,10 @@ def _pastikan_judul(judul, indeks, run_id):
 #     diam-diam tidak menulis apa pun (lihat
 #     _stmt_sisip_publication_authors).
 #   - publication_authors_repointed menghitung tautan yang
-#     dialihkan dari author tiruan ke author pemilik (DELETE lama +
-#     INSERT baru untuk publikasi+urutan yang sama). Hanya terjadi
+#     dialihkan dari author lain (umumnya tiruan dari run sebelum
+#     migrasi 14) ke author pemilik (DELETE lama + INSERT baru
+#     untuk publikasi+urutan yang sama; DELETE kini berdasarkan
+#     (publication_id, author_order) saja). Hanya terjadi
 #     saat nama bentuk pendek pemilik terlanjur menempel di author
 #     lain dari run sebelum fix.
 #   - publication_authors_deleted menghitung tautan lama yang
@@ -2457,7 +2598,8 @@ def write_raw_scrape_result(envelope, scholar_id, raw_conn=None,
     return result_id
 
 
-def load_core_rows(core, conn=None, run_id=None, profil=None):
+def load_core_rows(core, conn=None, run_id=None, profil=None,
+                   baris_referensi=None):
     """Muat hasil mapper (5 bucket) ke staging + core dalam satu transaksi.
 
     Parameter
@@ -2481,11 +2623,27 @@ def load_core_rows(core, conn=None, run_id=None, profil=None):
         kompatibilitas untuk pemanggil yang tidak punya envelope
         (mis. test_database.py memanggil tanpa profil). Penulisan
         core tidak pernah bergantung pada nilai ini.
+    baris_referensi : list[dict] | None, opsional
+        Daftar baris Excel referensi (kunci `no`, `nama`,
+        `scholar_id`, `prodi`) untuk SUMBER program_study author
+        PEMILIK profil (kolom core.authors.program_study). Nilai
+        diambil lewat prodi_pemilik() dengan gerbang verifikasi
+        yang SAMA dengan jalur raw (id eksak + nama cocok); kalau
+        verifikasi gagal atau None, program_study tetap NULL dan
+        perilaku identik dengan sebelum kolom ini ada. Prodi yang
+        lolos disimpan BAIK saat pemilik baru dibuat (lewat UPSERT
+        _stmt_buat_author) MAUPUN saat pemilik sudah ada di tabel
+        (lewat UPDATE terpisah _stmt_isi_program_study_author,
+        COALESCE - tidak pernah menimpa nilai lama). Kolom
+        institutional lain (sinta_id / scopus_id / faculty) tetap
+        NULL - tidak ada sumbernya.
 
     Urutan penulisan (WAJIB, karena FK):
         1. author pemilik profil   -> author_id untuk metrics + baris
-        2. publications            -> publications_id per indeks
+        2. publications            -> publication_id per indeks
         3. publication_authors     -> publication_id + author_id
+                                      (nullable; NULL = co-author
+                                      tidak dikenal, migrasi 14)
         4. author_metrics          -> author_id pemilik
         5. publication_metrics     -> publication_id hasil (2)
 
@@ -2513,15 +2671,18 @@ def load_core_rows(core, conn=None, run_id=None, profil=None):
     Perilaku UPSERT
     ---------------
     Baris (1) dan (2) memakai ON CONFLICT, jadi menjalankan ulang
-    tidak menggandakan isi core. publications_id / author_id yang
+    tidak menggandakan isi core. publication_id / author_id yang
     dipakai di langkah (3)-(5) adalah id yang dikembalikan
     UPSERT, yaitu id yang sudah ada kalau barisnya memang sudah
     ada - sehingga tautan dari run sebelumnya tetap utuh.
-    author_id yang tidak ada di cache akan dibuat lewat
-    _stmt_buat_author(); AuthorResolver tidak berubah, cache
-    Python tetap hanya penghematan perjalanan ke database, dan
-    batasan UNIQUE + ON CONFLICT yang menjadi penjaga
-    kebenaran. Lihat _stmt_buat_author.
+    Sejak migrasi 14 author_id TIDAK dibuat lagi dari tautan:
+    hanya pemilik profil di langkah (1) yang lewat resolve()
+    (dan _stmt_buat_author bila belum ada); tautan memakai
+    resolver.cari() (cache-only), dan nama yang tidak dikenal
+    disimpan dengan author_id NULL + author_name. Identitas
+    tautan dijaga unique (publication_id, author_order) +
+    ON CONFLICT DO NOTHING, bukan lagi tripel dengan author_id.
+    Lihat _stmt_buat_author dan _stmt_sisip_publication_authors.
 
     Kebijakan publication_authors (keputusan 3j, PERUBAHAN dari
     "publication_authors tidak pernah dihapus")
@@ -2537,16 +2698,18 @@ def load_core_rows(core, conn=None, run_id=None, profil=None):
         dilewati dan `publication_authors_skipped_downgrade` naik -
         data lengkap dari run detail tidak boleh diturunkan ke daftar
         terpotong. Kalau belum ada, tautan ditulis dengan logika
-        resolve + repoint seperti semula.
+        resolusi cache-only (cari; author_id NULL bila tidak
+        dikenal) + repoint seperti semula.
 
     Yang DILEWATI (tidak error)
     ---------------------------
     Dua hal:
       - Satu entri publication_authors yang nama penulisnya kosong
-        setelah dirapatkan. Nama begitu tidak bisa jadi
-        core.authors.name (NOT NULL) dan menebaknya berarti
-        mengarang identitas, jadi tautannya dihitung di `skipped`
-        dan load dilanjutkan. Kasus ini tidak mungkin terjadi di
+        setelah dirapatkan. Nama begitu tidak membawa identitas
+        apa pun (author_name-nya juga kosong, dan author_id-nya
+        NULL karena nama tak dikenal - dua kolom kosong = baris
+        tanpa guna), jadi tautannya dihitung di `skipped` dan load
+        dilanjutkan. Kasus ini tidak mungkin terter di
         mapper sekarang (_pecah_penulis sudah membuang elemen
         kosong), jadi angka ini harus 0.
       - Seluruh tautan sebuah publikasi bersumber "list" yang sudah
@@ -2617,11 +2780,42 @@ def load_core_rows(core, conn=None, run_id=None, profil=None):
         # ---------- 1. author pemilik profil ----------
         pemilik = core["authors"]
         _pastikan_nama_pemilik(pemilik.get("name"), run_id)
+        # program_study pemilik: HANYA dari Excel referensi yang
+        # lolos gerbang verifikasi K8 (id eksak + nama cocok) -
+        # selain itu None -> NULL, tanpa menebak. Gerbangnya sama
+        # dengan jalur raw (prodi_pemilik di author_records).
+        # Import lazy di sini dengan sengaja: author_records
+        # mengimpor helper dari modul ini, jadi import tingkat
+        # modul akan berputar (circular import) - pola yang sama
+        # dengan write_raw_scrape_result().
+        program_study = None
+        if baris_referensi:
+            from src.loading.author_records import prodi_pemilik
+            program_study = prodi_pemilik(
+                baris_referensi,
+                (profil or {}).get("scholar_id") or pemilik.get("scholar_id"),
+                (profil or {}).get("nama") or pemilik.get("name"),
+            )
         pemilik_id = resolver.resolve(
             _normalisasi_nama(pemilik["name"]),
             scholar_id=pemilik.get("scholar_id"),
+            program_study=program_study,
         )
         statistik["author_id"] = pemilik_id
+        # Prodi yang lolos verifikasi juga DISIMPAN lewat UPDATE
+        # terpisah, supaya berlaku BAIK untuk pemilik yang baru
+        # dibuat MAUPUN yang sudah ada di cache resolver (pada
+        # cache hit resolver tidak memanggil buat_author sama
+        # sekali, jadi UPSERT-nya tidak pernah dieksekusi dan
+        # prodi Excel tidak akan pernah sampai ke database).
+        # COALESCE di statement-nya membuat UPDATE ini no-op
+        # kalau kolomnya sudah terisi - lihat
+        # _stmt_isi_program_study_author. None = tanpa prodi /
+        # gagal verifikasi: statement tidak dieksekusi sama
+        # sekali, perilaku identik dengan sebelum kolom ini ada.
+        if program_study is not None:
+            conn.execute(_stmt_isi_program_study_author(
+                pemilik_id, program_study))
 
         # ---------- 2. publications ----------
         publikasi_id = []
@@ -2681,7 +2875,7 @@ def load_core_rows(core, conn=None, run_id=None, profil=None):
             # dengan nama lengkap baris pemilik. Halaman detail
             # kadang menulis varian yang dipotong per kata
             # ("Tri Agus D Kuntjoro"). Siapa yang SEKARANG memegang
-            # nama ini (bisa author tiruan, bisa None) harus dibaca
+            # nama ini (bisa author lain, bisa None) harus dibaca
             # SEBELUM nama diganti.
             lama_id = resolver.cari(nama_bersih)
             nama_pemilik = pemilik.get("name")
@@ -2692,22 +2886,35 @@ def load_core_rows(core, conn=None, run_id=None, profil=None):
                 # run tanpa detail); _varian_nama_pemilik hanya untuk
                 # jalur daftar penulis halaman detail, di mana varian
                 # potong-per-kata seperti kasus publikasi 48 muncul.
+                # Pemilik sudah pasti ada di cache (ditulis di
+                # langkah 1), jadi hasil cari-nya pemilik_id itu
+                # sendiri.
                 nama_bersih = _normalisasi_nama(nama_pemilik)
-            author_id = resolver.resolve(nama_bersih)
+            # Resolusi cache-ONLY (migrasi 14): tautan TIDAK PERNAH
+            # membuat author baru. Nama yang dikenal di cache (termasuk
+            # pemilik) memakai author_id itu; nama yang tidak dikenal
+            # author_id-nya NULL - baris tautan tetap disimpan dengan
+            # author_name-nya, tanpa baris author tiruan di
+            # core.authors.
+            author_id = resolver.cari(nama_bersih)
             # Repoint: bila nama tadi terlanjur menempel di author lain
             # (umumnya tiruan dari run sebelum fix), buang link lama
             # pada publikasi+urutan ini supaya tidak muncul dua author
             # pada urutan yang sama. Jalur detail sudah menghapus semua
-            # tautan, jadi tidak perlu repoint per tautan.
+            # tautan, jadi tidak perlu repoint per tautan. DELETE-nya
+            # berdasar (publication_id, author_order) saja - author_id
+            # tidak lagi bagian identitas baris (migrasi 14).
             if indeks not in publikasi_detail and \
                     lama_id is not None and lama_id != author_id:
                 conn.execute(_stmt_hapus_tautan(
-                    publikasi_id[indeks], lama_id, tautan["author_order"]))
+                    publikasi_id[indeks], tautan["author_order"]))
                 statistik["publication_authors_repointed"] += 1
             conn.execute(_stmt_sisip_publication_authors(
                 publikasi_id[indeks],
                 author_id,
                 tautan["author_order"],
+                author_name=tautan.get("author_name"),
+                author_type=tautan.get("author_type"),
             ))
             statistik["publication_authors_inserted"] += 1
 
@@ -2808,15 +3015,18 @@ def load_scholar_run(envelope, scholar_id, conn=None, raw_conn=None,
         Diteruskan ke write_raw_scrape_result().
     baris_referensi : list[dict] | None, opsional
         Daftar baris referensi Excel (kunci `no`, `nama`,
-        `scholar_id`) untuk GERBANG verifikasi pemilik profil terhadap
-        nama profil envelope. Diteruskan apa adanya ke
-        write_raw_scrape_result(); modul ini TIDAK membaca Excel
-        sendiri. None (default) berarti tidak ada referensi, jadi
-        SEMUA record author jadi belum_terverifikasi (nol pemilik).
-        Nilai ini memengaruhi isi record author yang DISIMPAN ke
-        raw.scholar_publication_author (G2-B) dan statistiknya -
-        bukan transaksi core, bukan pula nilai kembalian selain
-        kunci statistik author.
+        `scholar_id`, `prodi`) untuk GERBANG verifikasi pemilik profil
+        terhadap nama profil envelope. Diteruskan ke
+        write_raw_scrape_result() (mengisi record author raw +
+        prodi raw.scholar_author) DAN ke load_core_rows() (sumber
+        program_study core.authors untuk pemilik profil); modul ini
+        TIDAK membaca Excel sendiri. None (default) berarti tidak ada
+        referensi, jadi SEMUA record author jadi
+        belum_terverifikasi (nol pemilik) dan program_study pemilik
+        di core tetap NULL. Nilai ini memengaruhi isi record author
+        yang DISIMPAN ke raw.scholar_publication_author (G2-B),
+        kolom prodi raw.scholar_author, program_study pemilik di
+        core.authors, dan statistiknya.
 
     Statistik author (P58 + G2-B)
     -----------------------------
@@ -3035,7 +3245,8 @@ def load_scholar_run(envelope, scholar_id, conn=None, raw_conn=None,
             "batches": data.get("batches"),
             "elapsed": data.get("elapsed"),
         }
-    statistik = load_core_rows(core, conn=conn, run_id=run_id, profil=profil)
+    statistik = load_core_rows(core, conn=conn, run_id=run_id, profil=profil,
+                               baris_referensi=baris_referensi)
     statistik["raw_result_id"] = raw_result_id
     # Gabung ADDITIF ketujuh kunci statistik author (P58). Kunci ini
     # tidak pernah tumpang tindih dengan kunci yang dikembalikan

@@ -392,6 +392,9 @@ def test_to_core_rows_jalur_detail():
 
     assert len(core["publications"]) == 1
     pub = core["publications"][0]
+    # Placeholder kolom SERIAL publications.publication_id: key ada,
+    # nilainya None sampai database mengisinya.
+    assert pub["publication_id"] is None
     assert pub["author_source"] == "detail"
     assert pub["publication_year"] == 2024
     assert pub["publication_date"] == "2024-12-31"
@@ -402,10 +405,14 @@ def test_to_core_rows_jalur_detail():
     assert pub["link"] == "https://example.com/paper"
     assert pub["doi"] is None
 
-    pa = core["publication_authors"][0]
-    assert pa["publication_index"] == 0
-    assert pa["author_name"] == "Budi Santoso"
-    assert pa["author_order"] == 0
+    pa = core["publication_authors"]
+    assert pa[0]["publication_index"] == 0
+    assert pa[0]["author_name"] == "Budi Santoso"
+    assert pa[0]["author_order"] == 0
+    # author_type: penulis pertama + dua co_author (3 penulis detail).
+    assert [b["author_type"] for b in pa] == [
+        "penulis_pertama", "co_author", "co_author",
+    ]
 
     pm = core["publication_metrics"][0]
     assert pm["citation_count"] == 10
@@ -446,6 +453,49 @@ def test_to_core_rows_jalur_list():
     assert pub["link"] is None
 
     assert core["publication_authors"][0]["author_name"] == "B. Santoso"
+
+    # Dua penulis daftar: yang pertama penulis_pertama, sisanya co_author.
+    assert [b["author_type"] for b in core["publication_authors"]] == [
+        "penulis_pertama", "co_author",
+    ]
+    assert core["publications"][0]["publication_id"] is None
+
+
+# ------------------------------------------------------------
+# to_core_rows: author_type - kosakata penulis_pertama / co_author
+# ------------------------------------------------------------
+
+def test_to_core_rows_author_type_penulis_pertama_dan_co_author():
+    """author_order 0 -> penulis_pertama; sisanya co_author.
+
+    Kasus satu penulis (hanya penulis_pertama) dan kasus multi
+    penulis (pertama + co_author) diuji berdampingan karena nilai
+    bergantung pada urutan, bukan pada jalur detail/list.
+    """
+    # Satu penulis.
+    satu = to_core_rows({"rows": [{
+        "title": "Satu Penulis",
+        "authors": "A. Satu",
+        "citations": 0,
+    }]})
+    pa_satu = satu["publication_authors"]
+    assert [b["author_type"] for b in pa_satu] == ["penulis_pertama"]
+    assert pa_satu[0]["author_order"] == 0
+
+    # Multi penulis.
+    banyak = to_core_rows({"rows": [{
+        "title": "Multi Penulis",
+        "authors": "A. Satu, B. Dua, C. Tiga",
+        "citations": 0,
+    }]})
+    pa_banyak = banyak["publication_authors"]
+    assert [b["author_type"] for b in pa_banyak] == [
+        "penulis_pertama", "co_author", "co_author",
+    ]
+    assert [b["author_order"] for b in pa_banyak] == [0, 1, 2]
+    # author_name dan author_type kini kolom DB, keduanya selalu terisi.
+    assert all(b["author_name"] for b in pa_banyak)
+    assert all(b["author_type"] for b in pa_banyak)
 
 
 # ------------------------------------------------------------

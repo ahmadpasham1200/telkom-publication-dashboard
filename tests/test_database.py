@@ -10,9 +10,11 @@ Cakupan file ini dua bagian:
 
 2. Integrasi `load_core_rows()` dengan koneksi KELIRUAN (fake) dan
    store author palsu - tanpa database. Yang dibuktikan: tautan yang
-   namanya bentuk pendek pemilik menempel di author_id PEMILIK dan
-   tidak membuat author tiruan, sedangkan co-author sungguhan tetap
-   membuat author baru.
+   namanya bentuk pendek pemilik menempel di author_id PEMILIK;
+   co-author yang tidak dikenal TIDAK membuat author baru (migrasi
+   14) - tautannya disimpan dengan author_id NULL + author_name,
+   sedangkan co-author yang sudah ada di cache memakai author_id
+   lamanya.
 
 Kenapa fake-nya dua objek terpisah:
   - `PostgresAuthorStore` DI-MONKEYPATCH (kontraknya cuma 2 method:
@@ -20,7 +22,7 @@ Kenapa fake-nya dua objek terpisah:
     diamati tanpa SQL.
   - Koneksi palsu hanya perlu `in_transaction()`, `begin()`, dan
     `execute()`; yang WAJIB mengembalikan nilai hanya INSERT
-    publications (RETURNING publications_id). sisanya diabaikan.
+    publications (RETURNING publication_id). sisanya diabaikan.
 
 Cara menjalankan:
     python -m pytest tests/test_database.py -q
@@ -40,6 +42,7 @@ if str(_ROOT) not in sys.path:
 
 import pytest  # noqa: E402
 
+from sqlalchemy import UniqueConstraint  # noqa: E402
 from sqlalchemy.dialects import postgresql  # noqa: E402
 
 from src.loading import postgres  # noqa: E402
@@ -191,8 +194,11 @@ def _store_palsu(rekaman, existing=()):
     """Kelas store palsu dengan kontrak persis AuthorResolver.
 
     Kontrak (lihat PostgresAuthorStore): daftar_author() dan
-    buat_author(nama, scholar_id=None). ID baru naik dari 1; nama yang
-    sudah ada di `existing` tidak pernah dibuat ulang.
+    buat_author(nama, scholar_id=None, program_study=None). ID baru
+    naik dari 1; nama yang sudah ada di `existing` tidak pernah
+    dibuat ulang. `program_study` dicatat terpisah di
+    rekaman["prodi"] supaya tes bisa memeriksa sumbernya tanpa
+    mengubah bentuk tuple rekaman["dibuat"] (yang dipakai tes lama).
     """
     class StorePalsu:
         def __init__(self, conn):
@@ -201,12 +207,13 @@ def _store_palsu(rekaman, existing=()):
         def daftar_author(self):
             return list(existing)
 
-        def buat_author(self, nama, scholar_id=None):
+        def buat_author(self, nama, scholar_id=None, program_study=None):
             if any(nama.casefold() == n.casefold() for _, n in existing):
                 # Meniru ON CONFLICT: nama yang sudah ada kembali id
                 # lamanya, bukan baris kedua.
                 return next(i for i, n in existing if n.casefold() == nama.casefold())
             rekaman["dibuat"].append((nama, scholar_id))
+            rekaman["prodi"].append((nama, program_study))
             rekaman["berikut"] += 1
             return rekaman["berikut"]
 
@@ -250,16 +257,26 @@ class _TransaksiPalsu:
 class _KoneksiPalsu:
     """Koneksi tiruan yang cukup untuk load_core_rows().
 
-    Satu-satunya nilai WAJIB dikembalikan adalah publications_id dari
-    INSERT core.publications (RETURNING publications_id); sisanya
+    Satu-satunya nilai WAJIB dikembalikan adalah publication_id dari
+    INSERT core.publications (RETURNING publication_id); sisanya
     (publication_authors, metrics) dicatat untuk asersi lalu diabaikan.
     """
 
     def __init__(self):
         self.transaksi: _TransaksiPalsu | None = None
         self._id_publikasi = 0
-        self.tautan = []  # (publication_id, author_id, author_order)
-        self.dihapus = []  # (publication_id, author_id, author_order)
+        # (publication_id, author_id, author_order, author_name, author_type)
+        self.tautan = []
+        # DELETE repoint kini berdasar (publication_id, author_order)
+        # saja - author_id tidak lagi bagian identitas baris (migrasi
+        # 14), jadi tidak ada di WHERE dan tidak ikut dicatat.
+        self.dihapus = []  # (publication_id, author_order)
+        # (author_id, program_study) per UPDATE core.authors
+        # (_stmt_isi_program_study_author) - dicatat untuk asersi
+        # tes program_study; INSERT author lewat store dipalsukan,
+        # jadi satu-satunya pernyataan authors di koneksi tiruan
+        # ini adalah UPDATE itu.
+        self.prodi_author = []
 
     def in_transaction(self):
         return False
@@ -277,21 +294,47 @@ class _KoneksiPalsu:
         if tabel.name == "publications":
             self._id_publikasi += 1
             return _HasilPalsu(scalar=self._id_publikasi)
+        if tabel.name == "authors":
+            # UPDATE program_study pemilik (fill-only-when-NULL).
+            # Nama param hasil compile: coalesce_1 + author_id_1
+            # (lihat _stmt_isi_program_study_author).
+            stmt_type = type(stmt).__name__.lower()
+            if "update" in stmt_type:
+                nilai = stmt.compile(dialect=postgresql.dialect()).params
+                self.prodi_author.append((
+                    nilai.get("author_id_1"),
+                    nilai.get("coalesce_1"),
+                ))
+            return _HasilPalsu()
         if tabel.name == "publication_authors":
             # Deteksi DELETE vs INSERT berdasarkan tipe statement.
             stmt_type = type(stmt).__name__.lower()
             nilai = stmt.compile(dialect=postgresql.dialect()).params
             if "delete" in stmt_type:
+                # Jangan memilih nilai dengan `or`: nilai 0 (author_order
+                # 0-based, migrasi 14) sah tapi dianggap hilang oleh `or`.
+                # Pilih kunci berdasarkan keberadaannya; nama kunci hasil
+                # compile bisa polos atau berakhiran _1 (tergantung bentuk
+                # WHERE). Kunci yang memang tidak ada - mis. DELETE
+                # _stmt_hapus_semua_tautan (jalur detail) yang hanya
+                # memfilter publication_id - tetap None seperti toleransi
+                # perilaku lama.
+                def _ambil(*nama):
+                    for kunci in nama:
+                        if kunci in nilai:
+                            return nilai[kunci]
+                    return None
                 self.dihapus.append((
-                    nilai.get("publication_id") or nilai.get("publication_id_1"),
-                    nilai.get("author_id") or nilai.get("author_id_1"),
-                    nilai.get("author_order") or nilai.get("author_order_1"),
+                    _ambil("publication_id", "publication_id_1"),
+                    _ambil("author_order", "author_order_1"),
                 ))
                 return _HasilPalsu()
             self.tautan.append((
                 nilai["publication_id"],
                 nilai["author_id"],
                 nilai["author_order"],
+                nilai.get("author_name"),
+                nilai.get("author_type"),
             ))
         return _HasilPalsu()
 
@@ -404,6 +447,10 @@ def _core(pemilik, tautan, scholar_id="8kDg_v4AAAAJ", sumber=None):
     yaitu penanda keputusan 3j: "detail" (otoritatif) atau daftar
     (None/tidak diisi). Default None = jalur daftar, sama seperti
     test-test lama di file ini.
+
+    Tiap tautan memuat author_name, author_order, publication_index,
+    dan author_type (penulis_pertama untuk urutan 0, sisanya
+    co_author) - kunci persis keluaran mapper lane.
     """
     publications = [
         {"title": "Publikasi Satu", "publication_date": "2024-05-01"},
@@ -415,13 +462,20 @@ def _core(pemilik, tautan, scholar_id="8kDg_v4AAAAJ", sumber=None):
     return {
         "authors": {"name": pemilik, "scholar_id": scholar_id},
         "publications": publications,
+        # Pemetaan ke publikasi dipertahankan dari versi lama fixture
+        # agar cakupan tes tidak berubah: penulis PERTAMA menunjuk
+        # publikasi indeks 1, penulis KEDUA indeks 0, lalu
+        # bergantian. author_order kini 0-based sesuai kontrak
+        # mapper; karena itu penulis_pertama menempel pada urutan 0.
         "publication_authors": [
             {
-                "publication_index": urut % 2,
+                "publication_index": 1 if urut % 2 == 0 else 0,
                 "author_name": nama,
                 "author_order": urut,
+                "author_type": ("penulis_pertama" if urut == 0
+                                else "co_author"),
             }
-            for urut, nama in enumerate(tautan, start=1)
+            for urut, nama in enumerate(tautan)
         ],
         "author_metrics": {
             "source": "google_scholar",
@@ -442,14 +496,20 @@ def _core(pemilik, tautan, scholar_id="8kDg_v4AAAAJ", sumber=None):
     }
 
 
-def _jalankan(monkeypatch, pemilik, tautan, existing=(), sumber=None):
+def _jalankan(monkeypatch, pemilik, tautan, existing=(), sumber=None,
+              baris_referensi=None):
     """Jalankan load_core_rows dengan store & koneksi palsu.
 
     `sumber` diteruskan ke _core() sebagai author_source publikasi
     (None = jalur daftar, "detail" = jalur halaman detail).
+    `baris_referensi` diteruskan ke load_core_rows sebagai sumber
+    program_study pemilik profil.
     """
     rekaman = {
         "dibuat": [],
+        # (nama, program_study) per author yang benar-benar dibuat;
+        # dipakai tes program_study tanpa mengubah bentuk "dibuat".
+        "prodi": [],
         # ID baru naik dari atas ID yang sudah ada, supaya tidak pernah
         # bentrok dengan baris lama yang ikut dimuat ke cache.
         "berikut": max((i for i, _ in existing), default=0),
@@ -458,7 +518,8 @@ def _jalankan(monkeypatch, pemilik, tautan, existing=(), sumber=None):
                         _store_palsu(rekaman, existing))
     conn = _KoneksiPalsu()
     statistik = postgres.load_core_rows(
-        _core(pemilik, tautan, sumber=sumber), conn=conn, run_id="run-uji")
+        _core(pemilik, tautan, sumber=sumber), conn=conn, run_id="run-uji",
+        baris_referensi=baris_referensi)
     return statistik, conn, rekaman
 
 
@@ -501,8 +562,12 @@ def test_pemilik_sudah_ada_di_tabel_tidak_dibuat_ulang(monkeypatch):
     assert statistik["authors_created"] == 0
 
 
-def test_co_author_bukan_pemilik_tetap_dibuat_baru(monkeypatch):
-    """Co-author yang bukan bentuk pendek pemilik tetap author baru."""
+def test_co_author_tidak_dikenal_tanpa_author_baru(monkeypatch):
+    """Co-author yang bukan pemilik TIDAK dibuat lagi (migrasi 14).
+
+    Tautannya tetap disimpan, tapi author_id-nya NULL - tanpa
+    pemanggilan buat_author sama sekali untuk nama co-author.
+    """
     statistik, conn, rekaman = _jalankan(
         monkeypatch, PEMILIK_LENGKAP,
         ["TAD Kuntjoro", "AS Albana", "MIR Riansyah"])
@@ -512,23 +577,45 @@ def test_co_author_bukan_pemilik_tetap_dibuat_baru(monkeypatch):
 
     # Nama pendek pemilik -> tertaut ke pemilik.
     assert id_pendek == pemilik_id
-    # Co-author sungguhan -> author sendiri, bukan pemilik.
-    assert id_albana != pemilik_id
-    assert id_riansyah != pemilik_id
-    assert id_albana != id_riansyah
+    # Co-author tidak dikenal -> author_id NULL, bukan author baru.
+    assert id_albana is None
+    assert id_riansyah is None
+    # Tapi nama + perannya tetap tersimpan apa adanya.
+    assert [t[3] for t in conn.tautan] == [
+        "TAD Kuntjoro", "AS Albana", "MIR Riansyah"]
+    assert [t[4] for t in conn.tautan] == [
+        "penulis_pertama", "co_author", "co_author"]
 
-    assert [nama for nama, _ in rekaman["dibuat"]] == [
-        PEMILIK_LENGKAP, "AS Albana", "MIR Riansyah"]
-    assert statistik["authors_created"] == 3
+    # Satu-satunya author yang dibuat: pemilik profil itu sendiri.
+    assert rekaman["dibuat"] == [(PEMILIK_LENGKAP, "8kDg_v4AAAAJ")]
+    assert statistik["authors_created"] == 1
+    # Seluruh tautan tetap terhitung ter-sisip.
+    assert statistik["publication_authors_inserted"] == 3
 
 
-    assert statistik["authors_created"] == 3
+def test_co_author_dikenal_di_cache_memakai_id_lama(monkeypatch):
+    """Co-author yang sudah ada di core.authors memakai id lamanya.
+
+    Cache diisi dari tabel saat mulai; nama yang dikenal resolve ke
+    author_id yang sudah ada - tanpa INSERT, tanpa author_id NULL.
+    """
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro", "AS Albana"],
+        existing=[(67, PEMILIK_LENGKAP), (88, "AS Albana")])
+
+    assert conn.tautan[0][1] == 67
+    assert conn.tautan[1][1] == 88
+    assert conn.tautan[1][3] == "AS Albana"
+    assert rekaman["dibuat"] == []
+    assert statistik["authors_created"] == 0
+    assert statistik["publication_authors_repointed"] == 0
 
 
 def test_bentuk_pendek_yang_sudah_jadi_author_direwrite_ke_pemilik(monkeypatch):
-    """Nama pendek yang sudah jadi author tiruan (run sebelum fix)
+    """Nama pendek yang sudah menempel di author lain (run sebelum fix)
     dialihkan ke author_id pemilik. Link lama dihapus untuk
-    publikasi+urutan yang sama.
+    publikasi+urutan yang sama (identitas: publication_id +
+    author_order - migrasi 14).
     """
     statistik, conn, rekaman = _jalankan(
         monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro"],
@@ -540,7 +627,7 @@ def test_bentuk_pendek_yang_sudah_jadi_author_direwrite_ke_pemilik(monkeypatch):
     assert rekaman["dibuat"] == []
     assert statistik["authors_created"] == 0
     assert statistik["publication_authors_repointed"] == 1
-    assert conn.dihapus == [(2, 78, 1)]
+    assert conn.dihapus == [(2, 0)]
 
 
 def test_repoint_kasus_khodijah_amiroh(monkeypatch):
@@ -551,7 +638,7 @@ def test_repoint_kasus_khodijah_amiroh(monkeypatch):
 
     assert statistik["author_id"] == 238
     assert conn.tautan[0][1] == 238
-    assert conn.dihapus == [(2, 179, 1)]
+    assert conn.dihapus == [(2, 0)]
     assert statistik["publication_authors_repointed"] == 1
     assert rekaman["dibuat"] == []
 
@@ -642,6 +729,265 @@ def test_bentuk_pendek_tetap_berlaku_di_jalur_detail(monkeypatch):
     assert conn.tautan[0][1] == 67
     assert rekaman["dibuat"] == []
     assert statistik["authors_created"] == 0
+
+
+# ============================================================
+# 4. KOLOM BARU: author_name / author_type di
+#    core.publication_authors, dan program_study pemilik di
+#    core.authors (dari Excel referensi) - tanpa database.
+# ============================================================
+
+
+def test_tautan_membawa_author_name_dan_author_type(monkeypatch):
+    """author_name + author_type mapper diteruskan apa adanya ke INSERT.
+
+    Keduanya kini kolom NYATA di core.publication_authors; nilai yang
+    disimpan adalah salinan langsung dari dict tautan mapper (bukan
+    hasil resolusi nama).
+    """
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro", "AS Albana"])
+
+    assert len(conn.tautan) == 2
+    # Urutan pertama = penulis_pertama, sisanya co_author (kosakata
+    # sama dengan author_role raw.scholar_publication_author).
+    assert conn.tautan[0][3] == "TAD Kuntjoro"
+    assert conn.tautan[0][4] == "penulis_pertama"
+    assert conn.tautan[1][3] == "AS Albana"
+    assert conn.tautan[1][4] == "co_author"
+
+
+def test_stmt_sisip_publication_authors_kolom_dan_on_conflict():
+    """INSERT memuat author_name/author_type; target unik per-posisi."""
+    stmt = postgres._stmt_sisip_publication_authors(
+        10, 20, 0, author_name="Budi Santoso", author_type="penulis_pertama")
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    assert compiled.params["author_name"] == "Budi Santoso"
+    assert compiled.params["author_type"] == "penulis_pertama"
+    sql = str(compiled)
+    # Target ON CONFLICT (migrasi 14): unique (publication_id,
+    # author_order) - bukan lagi tripel dengan author_id yang kini
+    # bisa NULL.
+    assert "ON CONFLICT (publication_id, author_order) DO NOTHING" in sql
+    assert "(publication_id, author_id, author_order)" not in sql
+
+
+def test_stmt_sisip_publication_authors_tanpa_nama_tetap_null():
+    """Tanpa author_name/author_type (panggilan lama) keduanya NULL."""
+    stmt = postgres._stmt_sisip_publication_authors(10, 20, 1)
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    assert compiled.params["author_name"] is None
+    assert compiled.params["author_type"] is None
+
+
+def test_stmt_sisip_publication_authors_author_id_null(monkeypatch):
+    """author_id NULL (co-author tidak dikenal) tetap sah di INSERT."""
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro", "AS Albana"])
+
+    # Tautan kedua: author_id None diteruskan apa adanya (bukan
+    # diganti 0 / string "NULL" / dilempar).
+    assert conn.tautan[1][1] is None
+    assert conn.tautan[1][3] == "AS Albana"
+
+
+def test_stmt_hapus_tautan_identitas_publikasi_dan_urutan():
+    """DELETE repoint berdasar (publication_id, author_order) saja."""
+    stmt = postgres._stmt_hapus_tautan(12, 3)
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "WHERE" in sql
+    assert "publication_id" in sql
+    assert "author_order" in sql
+    # author_id TIDAK ada di WHERE - tidak lagi bagian identitas.
+    assert "author_id" not in sql
+    # Nama param hasil compile memakai sufiks _1 (bentrok dengan
+    # nama kolom) - lihat pola sama di _stmt_isi_program_study_author.
+    assert compiled.params["publication_id_1"] == 12
+    assert compiled.params["author_order_1"] == 3
+
+
+def test_stmt_sisip_publication_authors_pk_surrogate_dan_unik():
+    """Mirror: PK surrogate publication_author_id + unique per-posisi."""
+    tabel = postgres.PUBLICATION_AUTHORS
+    pk = [kolom.name for kolom in tabel.primary_key.columns]
+    assert pk == ["publication_author_id"]
+    # author_id nullable: co-author tidak dikenal disimpan NULL.
+    assert tabel.c.author_id.nullable is True
+    # Ada UniqueConstraint (publication_id, author_order) - identitas
+    # baris pasca-migrasi 14, sekaligus target ON CONFLICT INSERT.
+    batas_unik = [
+        batas for batas in tabel.constraints
+        if isinstance(batas, UniqueConstraint)
+    ]
+    assert len(batas_unik) == 1
+    assert [kolom.name for kolom in batas_unik[0].columns] == [
+        "publication_id", "author_order"]
+
+
+def test_stmt_sisip_publikasi_returning_publication_id():
+    """RETURNING memakai kolom publication_id (rename dari
+    publications_id), bukan nama lama."""
+    baris = {"title": "Judul", "publication_year": 2024}
+    stmt = postgres._stmt_sisip_publikasi(baris)
+    sql = str(stmt.compile(dialect=postgresql.dialect()))
+    assert "RETURNING core.publications.publication_id" in sql
+    assert "publications_id" not in sql
+
+
+def test_program_study_pemilik_dari_referensi_terverifikasi(monkeypatch):
+    """Referensi valid (id cocok + nama cocok eksak) -> program_study
+    pemilik terisi; co-author tetap None."""
+    referensi = [{
+        "no": 1,
+        "nama": PEMILIK_LENGKAP,
+        "scholar_id": "8kDg_v4AAAAJ",
+        "prodi": "Teknik Informatika",
+    }]
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro", "AS Albana"],
+        baris_referensi=referensi)
+
+    # Sejak migrasi 14 hanya pemilik yang dibuat - co-author tidak
+    # dikenal disimpan author_id NULL tanpa author baru, jadi prodi
+    # tercatat hanya untuk pemilik.
+    assert rekaman["prodi"] == [
+        (PEMILIK_LENGKAP, "Teknik Informatika"),
+    ]
+    assert statistik["author_id"] is not None
+    # Tautan co-author tetap ada dengan author_id NULL.
+    assert conn.tautan[1][1] is None
+
+
+def test_program_study_none_tanpa_referensi(monkeypatch):
+    """baris_referensi None -> program_study None, perilaku lama."""
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro"])
+
+    assert rekaman["prodi"] == [(PEMILIK_LENGKAP, None)]
+
+
+def test_program_study_none_bila_verifikasi_gagal(monkeypatch):
+    """Nama di referensi tidak cocok dengan nama profil -> None,
+    tanpa penebakan (gerbang K8 yang sama dengan jalur raw)."""
+    referensi = [{
+        "no": 1,
+        "nama": "Orang Lain",
+        "scholar_id": "8kDg_v4AAAAJ",
+        "prodi": "Teknik Informatika",
+    }]
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro"],
+        baris_referensi=referensi)
+
+    assert rekaman["prodi"] == [(PEMILIK_LENGKAP, None)]
+
+
+def test_stmt_buat_author_program_study_dan_coalesce():
+    """INSERT memuat program_study; DO UPDATE memakai COALESCE
+    supaya NULL baru tidak menghapus nilai lama."""
+    stmt = postgres._stmt_buat_author(
+        "Budi", scholar_id="ID1", program_study="Teknik Informatika")
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    assert compiled.params["program_study"] == "Teknik Informatika"
+    sql = str(compiled).replace(" ", "")
+    # COALESCE di DO UPDATE SET untuk program_study (dan scholar_id
+    # yang sudah ada sejak sebelumnya).
+    assert "program_study=coalesce" in sql
+    assert "scholar_id=coalesce" in sql
+
+
+def test_stmt_buat_author_tanpa_program_study_tetap_kolom_null():
+    """Panggilan tanpa program_study (co-author) -> NULL, dan
+    DO UPDATE tetap COALESCE (NULL tidak menimpa nilai lama)."""
+    stmt = postgres._stmt_buat_author("Budi")
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    assert compiled.params["program_study"] is None
+    assert "program_study=coalesce" in str(compiled).replace(" ", "")
+
+
+def test_stmt_isi_program_study_author_coalesce_saat_null():
+    """UPDATE isi-saat-NULL: COALESCE(program_study lama, nilai baru)
+    - nilai lama yang non-NULL tidak pernah tertimpa."""
+    stmt = postgres._stmt_isi_program_study_author(
+        67, "Teknik Informatika")
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    sql = str(compiled).replace(" ", "")
+    assert "UPDATEcore.authorsSETprogram_study=coalesce(core.authors.program_study" in sql
+    assert "WHEREcore.authors.author_id=" in sql
+    assert compiled.params["coalesce_1"] == "Teknik Informatika"
+    assert compiled.params["author_id_1"] == 67
+
+
+def test_pemilik_cache_hit_tetap_menerima_program_study(monkeypatch):
+    """Pemilik SUDAH ADA di tabel (cache hit) -> UPDATE tetap
+    dieksekusi, jadi prodi Excel tidak hilang percuma.
+
+    Ini celah yang ditambal _stmt_isi_program_study_author: pada
+    cache hit resolver tidak memanggil buat_author sama sekali,
+    jadi tanpa UPDATE ini prodi tidak pernah sampai ke database -
+    dan di production pemilik hampir selalu sudah ada.
+    """
+    referensi = [{
+        "no": 1,
+        "nama": PEMILIK_LENGKAP,
+        "scholar_id": "8kDg_v4AAAAJ",
+        "prodi": "Teknik Informatika",
+    }]
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro"],
+        existing=[(67, PEMILIK_LENGKAP)],
+        baris_referensi=referensi)
+
+    # Resolver: pemilik dari cache, tanpa INSERT author baru.
+    assert statistik["author_id"] == 67
+    assert rekaman["dibuat"] == []
+    # TAPI UPDATE program_study tetap terbang ke koneksi, dengan
+    # author_id pemilik dan prodi yang lolos verifikasi.
+    assert conn.prodi_author == [(67, "Teknik Informatika")]
+    # Tautan tetap menempel ke pemilik (perilaku lama utuh).
+    assert conn.tautan[0][1] == 67
+
+
+def test_pemilik_baru_dibuat_juga_mengirim_update_program_study(monkeypatch):
+    """Pemilik BARU dibuat: UPDATE ikut dieksekusi (no-op di DB
+    karena kolomnya sudah terisi lewat UPSERT) - jalur seragam,
+    tanpa cabang khusus."""
+    referensi = [{
+        "no": 1,
+        "nama": PEMILIK_LENGKAP,
+        "scholar_id": "8kDg_v4AAAAJ",
+        "prodi": "Teknik Informatika",
+    }]
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro"],
+        baris_referensi=referensi)
+
+    assert statistik["author_id"] == 1  # id baru dari store palsu
+    assert conn.prodi_author == [(1, "Teknik Informatika")]
+
+
+def test_tanpa_program_study_tidak_mengirim_update(monkeypatch):
+    """program_study None (tanpa referensi / verifikasi gagal) ->
+    statement UPDATE TIDAK dieksekusi sama sekali.
+
+    Sudah tercakup sebagian oleh test_program_study_none_* di
+    atas; ini memastikannya lewat sisi koneksi tiruan juga.
+    """
+    statistik, conn, rekaman = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro"])
+    assert conn.prodi_author == []
+
+    referensi_gagal = [{
+        "no": 1,
+        "nama": "Orang Lain",
+        "scholar_id": "8kDg_v4AAAAJ",
+        "prodi": "Teknik Informatika",
+    }]
+    statistik2, conn2, rekaman2 = _jalankan(
+        monkeypatch, PEMILIK_LENGKAP, ["TAD Kuntjoro"],
+        baris_referensi=referensi_gagal)
+    assert conn2.prodi_author == []
 
 
 # ============================================================
@@ -839,7 +1185,8 @@ def test_load_scholar_run_mode_lama_tetap_dua_tahap(monkeypatch):
         panggilan["transform"] += 1
         return {"publications": []}
 
-    def core_palsu(core, conn=None, run_id=None, profil=None):
+    def core_palsu(core, conn=None, run_id=None, profil=None,
+                   baris_referensi=None):
         panggilan["core"] += 1
         stat = postgres._stats_kosong()
         stat["status"] = postgres.STATUS_LOADED
@@ -1587,7 +1934,8 @@ def test_g2b_sembilan_kunci_di_semua_jalur_return(monkeypatch):
     assert statistik_skip["author_disimpan"] == 0
 
     # Jalur 3: loaded - writer asli untuk raw, load_core_rows tiruan.
-    def core_palsu(core, conn=None, run_id=None, profil=None):
+    def core_palsu(core, conn=None, run_id=None, profil=None,
+                   baris_referensi=None):
         stat = postgres._stats_kosong()
         stat["status"] = postgres.STATUS_LOADED
         return stat

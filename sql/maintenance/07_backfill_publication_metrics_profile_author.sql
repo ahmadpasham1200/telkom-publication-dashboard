@@ -36,8 +36,8 @@
 UPDATE core.publication_metrics pm
 SET profile_author_id = sub.author_id
 FROM (
-    SELECT DISTINCT ON (p.publications_id)
-           p.publications_id,
+    SELECT DISTINCT ON (p.publication_id)
+           p.publication_id,
            a.author_id
     FROM core.publications p
     JOIN raw.scholar_publication rp
@@ -46,9 +46,9 @@ FROM (
       ON rs.result_id = rp.result_id
     JOIN core.authors a
       ON a.scholar_id = rs.scholar_id
-    ORDER BY p.publications_id, rs.scraped_at DESC, a.author_id
+    ORDER BY p.publication_id, rs.scraped_at DESC, a.author_id
 ) sub
-WHERE pm.publication_id = sub.publications_id
+WHERE pm.publication_id = sub.publication_id
   AND pm.profile_author_id IS NULL;
 
 

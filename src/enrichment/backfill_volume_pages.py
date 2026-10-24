@@ -170,7 +170,7 @@ def _stmt_perbarui_publikasi():
            SET volume = :volume, pages = :pages
          WHERE title = :judul
            AND publication_year IS NOT DISTINCT FROM :tahun
-        RETURNING publications_id
+        RETURNING publication_id
 
     Kenapa IS NOT DISTINCT FROM dan BUKAN `=`:
     batasan uniknya adalah UNIQUE NULLS NOT DISTINCT (title,
@@ -199,7 +199,7 @@ def _stmt_perbarui_publikasi():
             volume=sa.bindparam("volume"),
             pages=sa.bindparam("pages"),
         )
-        .returning(PUBLICATIONS.c.publications_id)
+        .returning(PUBLICATIONS.c.publication_id)
     )
 
 
@@ -380,7 +380,7 @@ def main(argv=None):
                     gagal[_rapikan_teks(item.get(FIELD_EXTRA)) or ""] += 1
                     continue
 
-                publications_id = conn.execute(
+                publication_id = conn.execute(
                     stmt_perbarui,
                     {
                         "judul": judul,
@@ -389,7 +389,7 @@ def main(argv=None):
                         "pages": urai.pages,
                     },
                 ).scalar_one_or_none()
-                if publications_id is None:
+                if publication_id is None:
                     # Parse-nya benar, tapi tidak ada baris core dengan
                     # natural key itu. Artinya kunci kita BERBEDA dari
                     # yang ditulis loader (normalisasi judul/tahun yang

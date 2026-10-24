@@ -471,13 +471,13 @@ def _sql_pilih(maks=None):
     """
     stmt = (
         sa.select(
-            PUBLICATIONS.c.publications_id,
+            PUBLICATIONS.c.publication_id,
             PUBLICATIONS.c.title,
             PUBLICATIONS.c.publication_date,
             PUBLICATIONS.c.publication_year,
         )
         .where(PUBLICATIONS.c.doi.is_(None))
-        .order_by(PUBLICATIONS.c.publications_id)
+        .order_by(PUBLICATIONS.c.publication_id)
     )
     if maks is not None and maks > 0:
         stmt = stmt.limit(maks)
@@ -496,7 +496,7 @@ def _sql_perbarui(doi, publisher):
         nilai["publisher"] = publisher
     return (
         sa.update(PUBLICATIONS)
-        .where(PUBLICATIONS.c.publications_id == sa.bindparam("pid"))
+        .where(PUBLICATIONS.c.publication_id == sa.bindparam("pid"))
         .values(**nilai)
     )
 
