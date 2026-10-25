@@ -1,10 +1,14 @@
-scholarly
-pandas
-pandera
-SQLAlchemy
-psycopg[binary]
-prefect
-pytest
-python-dotenv
-requests
-openpyxl
+# Runtime: versions observed in the audited Python 3.12.7 environment.
+# Direct dependencies only; this is not a transitive lock file.
+playwright==1.63.0
+beautifulsoup4==4.13.3
+SQLAlchemy==2.0.45
+psycopg[binary]==3.3.6
+python-dotenv==1.2.1
+openpyxl==3.1.5
+
+# Runtime for the separate enrichment and journal-index modules.
+requests==2.32.3
+
+# Development / tests (kept here to use one installation command).
+pytest==9.1.1
