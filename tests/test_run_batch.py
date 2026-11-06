@@ -80,7 +80,8 @@ def test_baca_daftar_campuran_id_dan_kosong(tmp_path):
 
     assert len(hasil) == 4
     assert hasil[0] == {"no": 1, "nama": "Budi Santoso",
-                        "scholar_id": "AAA_id-1", "prodi": "Informatika"}
+                        "scholar_id": "AAA_id-1", "prodi": "Informatika",
+                        "status": ""}
     # Sel kosong (None) dan sel berisi spasi saja -> "".
     assert hasil[1]["scholar_id"] == ""
     assert hasil[1]["nama"] == "Siti Aminah"
@@ -88,7 +89,8 @@ def test_baca_daftar_campuran_id_dan_kosong(tmp_path):
     # Baris setelah sel kosong tetap terbaca, tidak ikut "tersedak".
     assert hasil[3] == {"no": 4, "nama": "Rina Marlina",
                         "scholar_id": "CCC_id-3",
-                        "prodi": "Teknik Logistik"}
+                        "prodi": "Teknik Logistik",
+                        "status": ""}
 
 
 def test_baca_daftar_baca_prodi_case_insensitive(tmp_path):
@@ -223,6 +225,12 @@ def _pasang_patch_jalan_sendiri(monkeypatch, hasil, panggilan):
     # Supaya test tidak pernah menyentuh PostgreSQL.
     monkeypatch.setattr(run_batch, "_statistik_dari_db",
                         lambda ids, url=None: {})
+    # Inisialisasi kolom status roster di-no-op-kan: test loop tidak
+    # sedang menguji penulisan Excel, dan tanpa patch ini ia akan
+    # mencoba koneksi DB (ids_riwayat_lengkap). Perilaku
+    # pastikan_kolom_status diuji terpisah di tests/test_status_roster.py.
+    monkeypatch.setattr(run_batch, "pastikan_kolom_status",
+                        lambda path, url=None: None)
 
 
 def _nilai(argv, nama):
@@ -393,6 +401,8 @@ def test_main_exception_persatu_dosen_tidak_mematikan_batch(tmp_path, monkeypatc
     monkeypatch.setattr(run_batch.run_pipeline, "main", meledak)
     monkeypatch.setattr(run_batch, "_statistik_dari_db",
                         lambda ids, url=None: {})
+    monkeypatch.setattr(run_batch, "pastikan_kolom_status",
+                        lambda path, url=None: None)
 
     rc = run_batch.main([
         "--file", xlsx, "--progress", str(progress),
@@ -429,7 +439,7 @@ def test_parse_args_wajibkan_file():
         run_batch.parse_args([])
     args = run_batch.parse_args(["--file", "x.xlsx"])
     assert args.file == "x.xlsx"
-    assert args.jeda == 8.0
+    assert args.jeda == 180.0
     assert args.mulai == 1
     assert args.progress == "data dosen/progress_batch.csv"
     assert args.lanjut is False and args.ulang is False
@@ -523,7 +533,7 @@ def test_argv_selalu_bawa_referensi_dosen():
 def test_argv_referensi_dosen_path_berspasi():
     """Path berisi spasi utuh sebagai SATU token --referensi-dosen=...
     dan tetap terbaca benar oleh parse asli."""
-    path = "data dosen/Data dosen.xlsx"
+    path = "data/dosen/Data dosen.xlsx"
     args = run_batch.parse_args(["--file", path])
     argv = run_batch._argv_run_pipeline(args, "ID_A")
 
@@ -563,6 +573,8 @@ def test_main_systemexit_tidak_mematikan_batch(tmp_path, monkeypatch):
     monkeypatch.setattr(run_batch.run_pipeline, "main", systemexit_2)
     monkeypatch.setattr(run_batch, "_statistik_dari_db",
                         lambda ids, url=None: {})
+    monkeypatch.setattr(run_batch, "pastikan_kolom_status",
+                        lambda path, url=None: None)
 
     rc = run_batch.main([
         "--file", xlsx, "--progress", str(progress),
@@ -601,6 +613,8 @@ def test_main_systemexit_tanpa_kode_angka_jadi_gagal(tmp_path, monkeypatch):
     monkeypatch.setattr(run_batch.run_pipeline, "main", systemexit_polos)
     monkeypatch.setattr(run_batch, "_statistik_dari_db",
                         lambda ids, url=None: {})
+    monkeypatch.setattr(run_batch, "pastikan_kolom_status",
+                        lambda path, url=None: None)
 
     rc = run_batch.main([
         "--file", xlsx, "--progress", str(progress),
@@ -637,6 +651,8 @@ def test_main_systemexit_130_menghentikan_batch(tmp_path, monkeypatch):
     monkeypatch.setattr(run_batch.run_pipeline, "main", systemexit_130)
     monkeypatch.setattr(run_batch, "_statistik_dari_db",
                         lambda ids, url=None: {})
+    monkeypatch.setattr(run_batch, "pastikan_kolom_status",
+                        lambda path, url=None: None)
 
     rc = run_batch.main([
         "--file", xlsx, "--progress", str(progress),
@@ -945,3 +961,846 @@ def test_main_lanjut_skip_gagal_scrape(tmp_path, monkeypatch):
 
     assert _id_dipanggil(panggilan) == ["ID_B"]
     assert rc == 0
+
+# ============================================================
+# Jalur roster: `belum` -> jalur awal, `sudah` -> incremental
+# ============================================================
+#
+# Semua yang menyentuh dunia luar di-patch:
+#   - run_pipeline.main            (jalur awal)
+#   - _statistik_dari_db           (baca DB)
+#   - pastikan_kolom_status        (penulis Excel awal)
+#   - scrape_scholar               (lazy import dari modul scraper)
+#   - baca_judul_tersimpan /
+#     load_scholar_run / connect   (lazy import dari modul postgres)
+# Tidak ada browser, tidak ada PostgreSQL, tidak ada Google Scholar.
+
+HEADER_STATUS = ["No", "NAMA", "scholar_id", "status", "pemeriksaan"]
+
+
+def _mod_scraper():
+    """Modul scraper: target patch impor lazy _proses_incremental."""
+    from src.ingestion import scrape_scholar_playwright
+    return scrape_scholar_playwright
+
+
+def _mod_pg():
+    """Modul postgres: target patch impor lazy jalur incremental."""
+    from src.loading import postgres
+    return postgres
+
+
+def _sel_excel(path, row, col):
+    """Baca satu sel workbook roster (Sheet1)."""
+    wb = openpyxl.load_workbook(str(path))
+    try:
+        ws = wb["Sheet1"]
+        return ws.cell(row=row, column=col).value
+    finally:
+        wb.close()
+
+
+def test_main_belum_jalur_awal_bukan_incremental(tmp_path, monkeypatch):
+    """Dosen `belum` -> run_pipeline.main (jalur awal penuh); scraper
+    incremental TIDAK pernah dipanggil."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "belum",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan)
+
+    dipanggil_scrape = []
+
+    def scrape_palsu(*a, **kw):
+        dipanggil_scrape.append((a, kw))
+        return {}
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert _id_dipanggil(panggilan) == ["ID_A"]
+    assert dipanggil_scrape == []
+    assert rc == 0
+
+
+def test_main_sukses_awal_status_roster_jadi_sudah(tmp_path, monkeypatch):
+    """Jalur awal exit 0 + run DB SUCCESS -> sel status jadi `sudah`;
+    kolom `pemeriksaan` TIDAK disentuh jalur awal."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "belum",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan)
+    monkeypatch.setattr(run_batch, "_statistik_dari_db",
+                        lambda ids, url=None: {
+                            "ID_A": {"status_run": "SUCCESS",
+                                     "ada_baris": True}})
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert rc == 0
+    daftar = run_batch.baca_daftar(xlsx)
+    assert daftar[0]["status"] == "sudah"
+    # Pemeriksaan tidak disentuh jalur awal (kolom 5).
+    assert _sel_excel(xlsx, 2, 5) == "belum_diperiksa"
+
+
+def test_main_parsial_awal_status_tetap_belum(tmp_path, monkeypatch):
+    """Jalur awal exit 0 tapi run PARTIAL_SUCCESS -> status tetap
+    `belum` (hanya SUCCESS yang menaikkan status roster)."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "belum",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan)
+    monkeypatch.setattr(run_batch, "_statistik_dari_db",
+                        lambda ids, url=None: {
+                            "ID_A": {"status_run": "PARTIAL_SUCCESS",
+                                     "ada_baris": True}})
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert rc == 0
+    daftar = run_batch.baca_daftar(xlsx)
+    assert daftar[0]["status"] == "belum"
+
+
+def test_main_sudah_jalur_incremental(tmp_path, monkeypatch):
+    """Dosen `sudah` -> run_pipeline.main TIDAK dipanggil; scrape
+    incremental dipanggil SEKALI dengan judul_sudah_tersimpan berupa
+    set; load_scholar_run menerima envelope itu dengan scholar_id dan
+    raw_only dari args."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    envelope = {"status": "SUCCESS",
+                "data": {"rows": [{"title": "Publikasi Baru"}]}}
+    panggilan_scrape = []
+
+    async def scrape_palsu(uid, **kw):
+        panggilan_scrape.append((uid, kw))
+        return envelope
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: ["Judul Lama"])
+
+    load_panggilan = []
+
+    def load_palsu(envelope_arg, scholar_id, conn=None, raw_conn=None,
+                   raw_only=False, baris_referensi=None):
+        load_panggilan.append({
+            "envelope": envelope_arg,
+            "scholar_id": scholar_id,
+            "conn": conn,
+            "raw_only": raw_only,
+            "baris_referensi": baris_referensi,
+        })
+        return {}
+
+    monkeypatch.setattr(pg, "load_scholar_run", load_palsu)
+
+    def connect_larang(*a, **kw):
+        raise AssertionError("connect dipanggil di mode raw-only")
+
+    monkeypatch.setattr(pg, "connect", connect_larang)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    # Jalur awal TIDAK dipanggil untuk dosen `sudah`.
+    assert panggilan_rp == []
+    assert len(panggilan_scrape) == 1
+    uid, kw = panggilan_scrape[0]
+    assert uid == "ID_A"
+    assert isinstance(kw["judul_sudah_tersimpan"], set)
+
+    assert len(load_panggilan) == 1
+    assert load_panggilan[0]["envelope"] is envelope
+    assert load_panggilan[0]["scholar_id"] == "ID_A"
+    assert load_panggilan[0]["conn"] is None
+    assert load_panggilan[0]["raw_only"] is True  # default P13
+    # Referensi = daftar penuh hasil baca_daftar (bentuk sama dengan
+    # yang diteruskan run_pipeline ke load_scholar_run).
+    referensi = load_panggilan[0]["baris_referensi"]
+    assert isinstance(referensi, list)
+    assert referensi[0]["scholar_id"] == "ID_A"
+
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK_RAW
+    assert data["ID_A"]["exit_code"] == "0"
+    assert rc == 0
+
+
+def test_main_sudah_judul_dinormalisasi(tmp_path, monkeypatch):
+    """judul_sudah_tersimpan berisi hasil normalisasi_judul atas judul
+    mentah dari baca_judul_tersimpan."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"]])
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    async def scrape_palsu(uid, **kw):
+        return {"status": "SUCCESS", "data": {"rows": []}}
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: ["Judul: A!", "Judul B"])
+    monkeypatch.setattr(pg, "load_scholar_run",
+                        lambda *a, **kw: {})
+
+    # normalisasi_judul: pakai yang asli bila lane scraper sudah
+    # mendarat; bila belum, fallback deterministik untuk test ini.
+    scraper = _mod_scraper()
+    try:
+        from src.ingestion.scrape_scholar_playwright import (
+            normalisasi_judul as norm)
+    except ImportError:
+        def norm(teks):
+            return ("" if teks is None else str(teks)).strip().lower()
+    monkeypatch.setattr(scraper, "normalisasi_judul", norm, raising=False)
+
+    panggilan_scrape = []
+
+    async def scrape_perekam(uid, **kw):
+        panggilan_scrape.append((uid, kw))
+        return {"status": "SUCCESS", "data": {"rows": []}}
+
+    monkeypatch.setattr(scraper, "scrape_scholar", scrape_perekam)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(tmp_path / "p.csv"),
+        "--jeda", "0",
+    ])
+
+    assert rc == 0
+    assert len(panggilan_scrape) == 1
+    _, kw = panggilan_scrape[0]
+    assert kw["judul_sudah_tersimpan"] == {norm("Judul: A!"),
+                                           norm("Judul B")}
+
+
+def test_main_sudah_hanya_publikasi_baru_tersimpan(tmp_path, monkeypatch):
+    """Envelope yang diterima loader hanya memuat publikasi BARU;
+    judul lama dari RAW tidak ikut."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"]])
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    envelope = {"status": "SUCCESS",
+                "data": {"rows": [{"title": "Judul Baru"}]}}
+
+    async def scrape_palsu(uid, **kw):
+        return envelope
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: ["Judul Lama"])
+
+    load_panggilan = []
+
+    def load_palsu(envelope_arg, scholar_id, **kw):
+        load_panggilan.append(envelope_arg)
+        return {}
+
+    monkeypatch.setattr(pg, "load_scholar_run", load_palsu)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(tmp_path / "p.csv"),
+        "--jeda", "0",
+    ])
+
+    assert rc == 0
+    assert len(load_panggilan) == 1
+    rows = load_panggilan[0]["data"]["rows"]
+    assert rows == [{"title": "Judul Baru"}]
+    assert all(row["title"] != "Judul Lama" for row in rows)
+
+
+def test_main_sudah_fatal_status_menjadi_belum_pemeriksaan_gagal(
+        tmp_path, monkeypatch):
+    """Run incremental fatal (TIMEOUT, mis. HTTP 429): status menjadi
+    `Belum`, `pemeriksaan` jadi `gagal` (bukan berhasil), dan
+    progress mencatat GAGAL_SCRAPE exit 2."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    envelope = {"status": "TIMEOUT", "data": None,
+                "error_message": "HTTP 429"}
+
+    async def scrape_palsu(uid, **kw):
+        return envelope
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: [])
+    monkeypatch.setattr(pg, "load_scholar_run", lambda *a, **kw: {})
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert _sel_excel(xlsx, 2, 4) == "Belum"
+    # Fatal TIDAK pernah dilaporkan sebagai pemeriksaan bersih.
+    pemeriksaan = _sel_excel(xlsx, 2, 5)
+    assert pemeriksaan == "gagal"
+    assert pemeriksaan != "berhasil"
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_GAGAL_SCRAPE
+    assert data["ID_A"]["exit_code"] == "2"
+    assert rc == 1
+
+
+def test_main_sudah_parsial_pemeriksaan_parsial(tmp_path, monkeypatch):
+    """PARTIAL_SUCCESS incremental -> pemeriksaan `parsial`, progress
+    OK_RAW exit 0 (data baru tersimpan sebagian)."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    envelope = {"status": "PARTIAL_SUCCESS",
+                "data": {"rows": [{"title": "Sebagian Baru"}]}}
+
+    async def scrape_palsu(uid, **kw):
+        return envelope
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: [])
+    monkeypatch.setattr(pg, "load_scholar_run", lambda *a, **kw: {})
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert _sel_excel(xlsx, 2, 4) == "Belum"
+    assert _sel_excel(xlsx, 2, 5) == "parsial"
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK_RAW
+    assert data["ID_A"]["exit_code"] == "0"
+    assert rc == 0
+
+
+def test_main_sudah_gagal_baca_judul_gagal_scrape(tmp_path, monkeypatch):
+    """baca_judul_tersimpan melempar -> GAGAL_SCRAPE exit 2,
+    pemeriksaan `gagal`, dan scraper TIDAK dilanjutkan (tanpa
+    himpunan judul lama, scraping penuh berisiko)."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    dipanggil_scrape = []
+
+    async def scrape_palsu(uid, **kw):
+        dipanggil_scrape.append(uid)
+        return {"status": "SUCCESS", "data": {"rows": []}}
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+
+    def baca_meledak(sid, url=None):
+        raise RuntimeError("DB down")
+
+    monkeypatch.setattr(pg, "baca_judul_tersimpan", baca_meledak)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert dipanggil_scrape == []
+    assert _sel_excel(xlsx, 2, 4) == "Belum"
+    assert _sel_excel(xlsx, 2, 5) == "gagal"
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_GAGAL_SCRAPE
+    assert data["ID_A"]["exit_code"] == "2"
+    assert rc == 1
+
+
+def test_main_sudah_gagal_load_gagal_load(tmp_path, monkeypatch):
+    """load_scholar_run melempar -> GAGAL_LOAD exit 1, pemeriksaan
+    `gagal`, kolom status tetap `sudah`."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    async def scrape_palsu(uid, **kw):
+        return {"status": "SUCCESS", "data": {"rows": []}}
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: [])
+
+    def load_meledak(*a, **kw):
+        raise RuntimeError("koneksi core putus")
+
+    monkeypatch.setattr(pg, "load_scholar_run", load_meledak)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert _sel_excel(xlsx, 2, 4) == "Belum"
+    assert _sel_excel(xlsx, 2, 5) == "gagal"
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_GAGAL_LOAD
+    assert data["ID_A"]["exit_code"] == "1"
+    assert rc == 1
+
+
+def test_main_sudah_interupsi_menghentikan_batch(tmp_path, monkeypatch):
+    """KeyboardInterrupt di scraper incremental -> batch berhenti rapi
+    (rc 130), dosen itu tidak dicatat di progress."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"],
+                       [2, "Andi Wijaya", "ID_B", "sudah",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    async def scrape_interupsi(uid, **kw):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_interupsi)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: [])
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert rc == 130
+    data = run_batch.baca_progress(str(progress))
+    assert "ID_A" not in data
+    assert "ID_B" not in data
+
+
+def test_main_ulang_tidak_memaksa_sudah_scrape_penuh(tmp_path, monkeypatch):
+    """--ulang mengalahkan --lanjut, tapi TIDAK mengubah mode dosen
+    `sudah`: tetap incremental, bukan run_pipeline penuh."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"]])
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    panggilan_scrape = []
+
+    async def scrape_palsu(uid, **kw):
+        panggilan_scrape.append(uid)
+        return {"status": "SUCCESS", "data": {"rows": []}}
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: [])
+    monkeypatch.setattr(pg, "load_scholar_run", lambda *a, **kw: {})
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(tmp_path / "p.csv"),
+        "--jeda", "0", "--lanjut", "--ulang",
+    ])
+
+    assert panggilan_rp == []
+    assert panggilan_scrape == ["ID_A"]
+    assert rc == 0
+
+# ============================================================
+# HTTP 429 (RATE_LIMITED, exit anak 3): batch berhenti penuh
+# ============================================================
+#
+# Kontrak: scraper menghasilkan status RATE_LIMITED saat HTTP 429
+# (navigasi awal / paging / detail); run_pipeline memetakannya ke
+# exit code 3; batch mencatat GAGAL_SCRAPE exit 3 lalu MENGHENTIKAN
+# SELURUH batch - dosen berikutnya tidak dipanggil, jeda antar
+# dosen dilewati, tidak ada retry. Semua di-mock; tidak ada
+# Scholar/DB/browser sungguhan.
+
+
+def _patch_sleep(monkeypatch):
+    """Patch time.sleep (dipakai run_batch untuk jeda antar dosen)
+    dan kembalikan list panggilannya supaya bisa dihitung."""
+    panggilan = []
+
+    def sleep_palsu(detik):
+        panggilan.append(detik)
+
+    monkeypatch.setattr(run_batch.time, "sleep", sleep_palsu)
+    return panggilan
+
+
+def test_main_exit_3_menghentikan_batch(tmp_path, monkeypatch):
+    """429 di navigasi awal: dosen[0] OK, dosen[1] exit 3 -> dosen[2]
+    TIDAK pernah dipanggil; jeda TIDAK dijalankan setelah 429;
+    progress mencatat OK_RAW (dosen[0]) dan GAGAL_SCRAPE exit 3
+    (dosen[1]); batch rc 1."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "belum",
+                        "belum_diperiksa"],
+                       [2, "Siti Aminah", "ID_B", "belum",
+                        "belum_diperiksa"],
+                       [3, "Andi Wijaya", "ID_C", "belum",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0, 3, 0], panggilan)
+    sleep_panggilan = _patch_sleep(monkeypatch)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "5",
+    ])
+
+    # Dosen[2] TIDAK pernah dipanggil.
+    assert _id_dipanggil(panggilan) == ["ID_A", "ID_B"]
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK_RAW
+    assert data["ID_A"]["exit_code"] == "0"
+    assert data["ID_B"]["status"] == run_batch.STATUS_GAGAL_SCRAPE
+    assert data["ID_B"]["exit_code"] == "3"
+    assert "ID_C" not in data
+    # Jeda hanya dijalankan SEBELUM 429 (gap ID_A -> ID_B), bukan
+    # setelahnya.
+    assert sleep_panggilan == [5.0]
+    assert rc == 1
+
+
+def test_main_systemexit_3_menghentikan_batch(tmp_path, monkeypatch):
+    """429 lewat SystemExit(3) dari anak -> perlakuan sama: record
+    ditulis (GAGAL_SCRAPE exit 3), dosen berikutnya tidak dipanggil,
+    jeda dilewati, rc 1."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "belum",
+                        "belum_diperiksa"],
+                       [2, "Siti Aminah", "ID_B", "belum",
+                        "belum_diperiksa"],
+                       [3, "Andi Wijaya", "ID_C", "belum",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan = []
+
+    # Anak: dosen[0] -> 0; dosen[1] -> SystemExit(3).
+    hitungan = {"n": 0}
+
+    def anak(argv):
+        panggilan.append(list(argv))
+        hitungan["n"] += 1
+        if hitungan["n"] == 2:
+            raise SystemExit(3)
+        return 0
+
+    monkeypatch.setattr(run_batch.run_pipeline, "main", anak)
+    monkeypatch.setattr(run_batch, "_statistik_dari_db",
+                        lambda ids, url=None: {})
+    monkeypatch.setattr(run_batch, "pastikan_kolom_status",
+                        lambda path, url=None: None)
+    sleep_panggilan = _patch_sleep(monkeypatch)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "5",
+    ])
+
+    assert _id_dipanggil(panggilan) == ["ID_A", "ID_B"]
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_B"]["status"] == run_batch.STATUS_GAGAL_SCRAPE
+    assert data["ID_B"]["exit_code"] == "3"
+    assert "ID_C" not in data
+    assert sleep_panggilan == [5.0]
+    assert rc == 1
+
+
+def test_main_exit_3_semua_fase_sama_di_level_batch(tmp_path, monkeypatch):
+    """429 di paging maupun di fase detail sama-sama tiba sebagai
+    exit anak 3 - perilaku batch identik (pembedaan fase ada di
+    level scraper, diuji lane scraper)."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "belum",
+                        "belum_diperiksa"],
+                       [2, "Siti Aminah", "ID_B", "belum",
+                        "belum_diperiksa"]])
+    for _ in range(2):  # assertion-light: dua fase, perilaku sama
+        panggilan = []
+        _pasang_patch_jalan_sendiri(monkeypatch, [3], panggilan)
+        _patch_sleep(monkeypatch)
+
+        rc = run_batch.main([
+            "--file", xlsx,
+            "--progress", str(tmp_path / "p.csv"),
+            "--jeda", "0",
+        ])
+
+        assert _id_dipanggil(panggilan) == ["ID_A"]
+        data = run_batch.baca_progress(str(tmp_path / "p.csv"))
+        assert data["ID_A"]["status"] == run_batch.STATUS_GAGAL_SCRAPE
+        assert data["ID_A"]["exit_code"] == "3"
+        assert rc == 1
+
+
+def test_main_incremental_rate_limited_raw_tersimpan_lalu_berhenti(
+        tmp_path, monkeypatch):
+    """Incremental 429: envelope RATE_LIMITED (dengan 1 baris parsial)
+    TETAP diteruskan ke load_scholar_run (raw tersimpan) SEBELUM
+    outcome dipetakan; progress GAGAL_SCRAPE exit 3; pemeriksaan
+    'gagal'; kolom `status` Excel TETAP 'sudah'; dosen berikutnya
+    tidak diproses; rc 1; scrape dipanggil tepat sekali (tanpa
+    retry)."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"],
+                       [2, "Siti Aminah", "ID_B", "sudah",
+                        "belum_diperiksa"],
+                       [3, "Andi Wijaya", "ID_C", "sudah",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+    sleep_panggilan = _patch_sleep(monkeypatch)
+
+    envelope_sukses = {"status": "SUCCESS", "data": {"rows": []}}
+    envelope_429 = {
+        "status": "RATE_LIMITED",
+        "error_message": "detail HTTP 429 - server meminta jeda",
+        "data": {"rows": [{"title": "Publikasi Parsial"}]},
+    }
+    panggilan_scrape = []
+
+    async def scrape_palsu(uid, **kw):
+        panggilan_scrape.append(uid)
+        if uid == "ID_A":
+            return envelope_sukses
+        return envelope_429
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: [])
+    load_panggilan = []
+
+    def load_palsu(envelope_arg, scholar_id, **kw):
+        load_panggilan.append((scholar_id, envelope_arg))
+        return {}
+
+    monkeypatch.setattr(pg, "load_scholar_run", load_palsu)
+
+    def connect_larang(*a, **kw):
+        raise AssertionError("connect dipanggil di mode raw-only")
+
+    monkeypatch.setattr(pg, "connect", connect_larang)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "5",
+    ])
+
+    # Dosen[2] tidak diproses; tanpa retry (ID_B scrape sekali).
+    assert panggilan_scrape == ["ID_A", "ID_B"]
+    assert panggilan_rp == []
+    # Envelope RATE_LIMITED (dengan baris parsial) SUDAH diteruskan
+    # ke loader sebelum outcome dipetakan -> raw tersimpan.
+    assert ("ID_B", envelope_429) in load_panggilan
+    assert len(load_panggilan) == 2
+    data = run_batch.baca_progress(str(progress))
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK_RAW
+    assert data["ID_B"]["status"] == run_batch.STATUS_GAGAL_SCRAPE
+    assert data["ID_B"]["exit_code"] == "3"
+    assert "ID_C" not in data
+    # Excel: pemeriksaan 'gagal', kolom status TETAP 'sudah'.
+    assert _sel_excel(xlsx, 3, 4) == "Belum"
+    assert _sel_excel(xlsx, 3, 5) == "gagal"
+    # Jeda hanya antara ID_A dan ID_B, tidak setelah 429.
+    assert sleep_panggilan == [5.0]
+    assert rc == 1
+
+
+def test_main_429_hasil_sebelumnya_utuh(tmp_path, monkeypatch):
+    """Hasil dosen sebelum 429 tidak terpengaruh: record progress
+    OK_RAW dan panggilan load (envelope SUCCESS) tetap utuh; tidak
+    ada panggilan loader tambahan setelah berhenti."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "sudah",
+                        "belum_diperiksa"],
+                       [2, "Siti Aminah", "ID_B", "sudah",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan_rp = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0], panggilan_rp)
+
+    envelope_sukses = {"status": "SUCCESS", "data": {"rows": []}}
+    envelope_429 = {"status": "RATE_LIMITED", "data": None,
+                    "error_message": "HTTP 429 dari server"}
+    panggilan_scrape = []
+
+    async def scrape_palsu(uid, **kw):
+        panggilan_scrape.append(uid)
+        return envelope_sukses if uid == "ID_A" else envelope_429
+
+    monkeypatch.setattr(_mod_scraper(), "scrape_scholar", scrape_palsu)
+
+    pg = _mod_pg()
+    monkeypatch.setattr(pg, "baca_judul_tersimpan",
+                        lambda sid, url=None: [])
+    load_panggilan = []
+
+    def load_palsu(envelope_arg, scholar_id, **kw):
+        load_panggilan.append((scholar_id, envelope_arg))
+        return {}
+
+    monkeypatch.setattr(pg, "load_scholar_run", load_palsu)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "0",
+    ])
+
+    assert rc == 1
+    # Tepat dua panggilan loader (satu per dosen); tidak ada
+    # panggilan "rollback"/hapus - fake tidak pernah dipanggil lagi
+    # setelah berhenti.
+    assert load_panggilan == [
+        ("ID_A", envelope_sukses),
+        ("ID_B", envelope_429),
+    ]
+    data = run_batch.baca_progress(str(progress))
+    # Record dosen[0] utuh, tidak tersentuh kegagalan dosen[1].
+    assert data["ID_A"]["status"] == run_batch.STATUS_OK_RAW
+    assert data["ID_A"]["exit_code"] == "0"
+
+
+def test_main_belum_exit_3_dan_exit_1_status_tetap_belum(
+        tmp_path, monkeypatch):
+    """`belum` + exit 3 (429) maupun exit 1 (GAGAL_LOAD) -> kolom
+    status Excel TETAP 'belum'; promosi ke 'sudah' hanya lewat
+    exit 0 + _statistik_dari_db SUCCESS (test terpisah)."""
+    for kode in (3, 1):
+        xlsx = buat_excel(
+            tmp_path / "dosen_{}.xlsx".format(kode), HEADER_STATUS,
+            [[1, "Budi Santoso", "ID_A", "belum", "belum_diperiksa"]])
+        panggilan = []
+        _pasang_patch_jalan_sendiri(monkeypatch, [kode], panggilan)
+
+        rc = run_batch.main([
+            "--file", xlsx,
+            "--progress", str(tmp_path / "p_{}.csv".format(kode)),
+            "--jeda", "0",
+        ])
+
+        assert rc == 1
+        assert _sel_excel(xlsx, 2, 4) == "Belum"
+
+
+def test_main_tanpa_429_semua_diproses_dan_jeda_jalan(
+        tmp_path, monkeypatch):
+    """Regresi: batch normal tanpa 429 tetap memproses semua dosen
+    dan menjalankan jeda antar dosen (n-1 kali)."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "belum",
+                        "belum_diperiksa"],
+                       [2, "Siti Aminah", "ID_B", "belum",
+                        "belum_diperiksa"],
+                       [3, "Andi Wijaya", "ID_C", "belum",
+                        "belum_diperiksa"]])
+    progress = tmp_path / "p.csv"
+    panggilan = []
+    _pasang_patch_jalan_sendiri(monkeypatch, [0, 0, 0], panggilan)
+    sleep_panggilan = _patch_sleep(monkeypatch)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(progress), "--jeda", "5",
+    ])
+
+    assert _id_dipanggil(panggilan) == ["ID_A", "ID_B", "ID_C"]
+    # Jeda antar dosen: setelah ID_A dan ID_B, tidak setelah ID_C.
+    assert sleep_panggilan == [5.0, 5.0]
+    assert rc == 0
+
+
+def test_main_pesan_berhenti_429_jujur_tanpa_klaim_verifikasi(
+        tmp_path, monkeypatch, capsys):
+    """Isi pesan berhenti: scholar_id, '429', jumlah profil yang
+    sudah diproses; bila _statistik_dari_db gagal dibaca, hitungan
+    sukses dilaporkan sebagai 'tercatat' (TIDAK diverifikasi) - bukan
+    klaim penyimpanan terverifikasi."""
+    xlsx = buat_excel(tmp_path / "dosen.xlsx", HEADER_STATUS,
+                      [[1, "Budi Santoso", "ID_A", "belum",
+                        "belum_diperiksa"],
+                       [2, "Siti Aminah", "ID_B", "belum",
+                        "belum_diperiksa"],
+                       [3, "Andi Wijaya", "ID_C", "belum",
+                        "belum_diperiksa"]])
+    panggilan = []
+
+    def anak(argv):
+        panggilan.append(list(argv))
+        return 0 if len(panggilan) == 1 else 3
+
+    monkeypatch.setattr(run_batch.run_pipeline, "main", anak)
+
+    def db_meledak(ids, url=None):
+        raise RuntimeError("DB down")
+
+    monkeypatch.setattr(run_batch, "_statistik_dari_db", db_meledak)
+    monkeypatch.setattr(run_batch, "pastikan_kolom_status",
+                        lambda path, url=None: None)
+    _patch_sleep(monkeypatch)
+
+    rc = run_batch.main([
+        "--file", xlsx, "--progress", str(tmp_path / "p.csv"),
+        "--jeda", "0",
+    ])
+
+    assert rc == 1
+    keluaran = capsys.readouterr().out
+    # scholar_id yang kena 429 + penanda 429 + hitungan proses.
+    assert "ID_B" in keluaran
+    assert "429" in keluaran
+    assert "Profil diproses sebelum berhenti : 2" in keluaran
+    # Jujur: TIDAK mengklaim verifikasi RAW saat baca DB gagal.
+    assert "Sukses terverifikasi di RAW" not in keluaran
+    assert "Tercatat sukses" in keluaran
+    assert "TIDAK diverifikasi" in keluaran
