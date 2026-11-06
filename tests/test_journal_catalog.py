@@ -42,7 +42,9 @@ def catalog_store():
         response = MagicMock()
         if isinstance(statement, sa.sql.elements.TextClause):
             assert str(statement).lstrip().upper().startswith('SELECT')
-            response.scalar_one_or_none.return_value = 'raw.journal_index_verification'
+            response.scalar_one_or_none.return_value = (
+                None if 'scimago_manual_verification' in str(statement)
+                else 'raw.journal_index_verification')
             return response
         compiled = statement.compile(dialect=postgresql.dialect())
         params, sql = compiled.params, str(compiled)
@@ -367,7 +369,7 @@ def test_dry_run_real_read_path_only_executes_select(monkeypatch, capsys):
             response.scalar_one.return_value = 'journal_catalog_unit_test'
         else:
             assert 'FROM raw.scholar_publication' in sql
-            assert parameters == {'row_limit': 1000}
+            assert parameters == {'row_limit': 1000, 'scholar_types': False}
             response.mappings.return_value = iter(rows)
         return response
 

@@ -10,6 +10,8 @@ from src.journal_index import scopus, scimagojr, sinta
 from src.journal_index.init import (candidates, classify, normalize_title, matches,
                                     issns, result)
 from src.journal_index import run_journal_index as runner
+from test_scopus_master import write_master
+from test_scimago_master import row as scimago_row, write_csv as write_scimago_csv
 
 
 @pytest.fixture(autouse=True)
@@ -26,11 +28,11 @@ def offline_journal_index_tests(monkeypatch):
         raise AssertionError('Live database/HTTP access is forbidden in unit tests')
     monkeypatch.setattr(sa.engine.Engine, 'connect', forbidden)
     monkeypatch.setattr(sa.engine.Engine, 'raw_connection', forbidden)
-    monkeypatch.setattr(scopus.requests.Session, 'request', forbidden)
 
 
-def journal(name='Journal of Testing'):
-    return candidates([{'raw_publication_id': 1, 'detail_venue': name}])[0]
+def journal(name='Journal of Testing', **fields):
+    return candidates([{'raw_publication_id': 1, 'detail_venue': name,
+                        'publication_year': 2024, **fields}])[0]
 
 
 def test_normalization_dedup_and_provenance():
@@ -62,39 +64,22 @@ def test_matching_and_issn():
     assert not matches(candidate, candidate.original, ['0309-0566'])
 
 
-def test_scopus_positive_and_no_inference():
-    candidate = journal()
-    entry = {'dc:title': candidate.original, 'source-id': '123', 'prism:issn': '0378-5955',
-             'prism:aggregationType': 'journal'}
-    payload = {'serial-metadata-response': {'entry': [entry]}}
-    assert scopus.parse_response(candidate, payload)['status'] == 'indexed'
-    entry.pop('source-id')
-    assert scopus.parse_response(candidate, payload)['status'] == 'unverified'
-    assert scopus.parse_response(candidate, {})['status'] == 'error'
+def test_scopus_positive_and_no_inference(tmp_path):
+    master = scopus.load_master(write_master(tmp_path))
+    checked = master.check(journal())
+    assert checked['status'] == 'indexed'
+    assert checked['metadata']['match_method'] == 'title_exact'
+    assert checked['metadata']['identity_match'] is True
     assert result('scopus', 'not_found')['indexed'] is None
     assert result('scopus', 'not_indexed')['indexed'] is False
 
 
-def test_missing_credentials(monkeypatch):
+def test_missing_credentials(tmp_path, monkeypatch):
     monkeypatch.delenv('SCOPUS_API_KEY', raising=False)
     monkeypatch.delenv('SINTA_USERNAME', raising=False)
     monkeypatch.delenv('SINTA_PASSWORD', raising=False)
-    assert scopus.check(journal())['status'] == 'access_unavailable'
+    assert scopus.check(journal(), master_path=tmp_path / 'missing.xlsx')['status'] == 'error'
     assert sinta.check(journal())['status'] == 'access_unavailable'
-
-
-def test_scopus_request_security_and_retry(monkeypatch):
-    monkeypatch.setenv('SCOPUS_API_KEY', 'secret-sentinel')
-    client = MagicMock()
-    client.get.side_effect = [scopus.requests.Timeout('secret-sentinel'),
-                              SimpleNamespace(status_code=403)]
-    sleep = MagicMock()
-    checked = scopus.check(journal(), session=client, sleep=sleep)
-    assert checked['status'] == 'access_unavailable'
-    assert 'secret-sentinel' not in str(checked)
-    assert client.get.call_args.kwargs['allow_redirects'] is False
-    assert client.get.call_args.kwargs['timeout'] == (5, 20)
-    sleep.assert_called_once_with(1)
 
 
 def test_manual_quartiles_and_ranks(tmp_path, monkeypatch):
@@ -149,7 +134,6 @@ def test_sources_and_writes_are_isolated(monkeypatch, caplog):
 
 
 def test_help_does_not_connect_or_authenticate(monkeypatch):
-    monkeypatch.setattr(scopus.requests.Session, 'get', MagicMock(side_effect=AssertionError))
     import src.loading.postgres as postgres
     build = MagicMock(side_effect=AssertionError)
     monkeypatch.setattr(postgres, 'build_engine', build)
@@ -157,6 +141,50 @@ def test_help_does_not_connect_or_authenticate(monkeypatch):
         runner.main(['--help'])
     assert exc.value.code == 0
     build.assert_not_called()
+
+
+@pytest.mark.parametrize('flag,reader,saver,source', [
+    ('--scimago', 'read_candidates', 'save_result', 'scimagojr'),
+    ('--scopus', 'read_scopus_candidates', 'save_scopus_results', 'scopus'),
+])
+def test_automatic_modes_read_all_and_save_per_unique_journal(
+        monkeypatch, capsys, flag, reader, saver, source):
+    import src.loading.postgres as postgres
+    engine = MagicMock()
+    engine.url.database = 'publication_dashboard'
+    engine.connect.return_value.__enter__.return_value.execute.return_value.scalar_one.return_value = 'publication_dashboard'
+    monkeypatch.setenv('POSTGRES_DB', 'publication_dashboard')
+    monkeypatch.setattr(postgres, 'build_engine', lambda: engine)
+    item = journal()
+    item.publications.append(dict(item.publications[0], raw_publication_id=2, scholar_id='different'))
+    selected = [item]
+    read = MagicMock(return_value=selected)
+    monkeypatch.setattr(runner, reader, read)
+    checker = MagicMock(return_value=result(source, 'indexed', metadata={
+        'method': 'scimago_master_csv', 'identity_match': True, 'source_id': '1',
+        'reference_year': 2025, 'match_method': 'title_exact'}))
+    master = SimpleNamespace(path='fixture-master', records=[], check=checker)
+    if source == 'scimagojr':
+        monkeypatch.setattr(runner.scimagojr, 'load_master', lambda *a: master)
+        monkeypatch.setattr(runner, 'create_table', MagicMock())
+    else:
+        monkeypatch.setattr(runner.scopus, 'load_master', lambda *a: master)
+    save = MagicMock(return_value=2)
+    monkeypatch.setattr(runner, saver, save)
+    assert runner.main([flag]) == 0
+    assert read.call_args.args[1:] == (None, None)
+    checker.assert_called_once_with(item)
+    assert save.call_count == 1
+    assert 'Total publikasi RAW diperiksa : 2' in capsys.readouterr().out
+
+
+def test_auto_modes_are_mutually_exclusive_and_do_not_take_scholar_id():
+    with pytest.raises(SystemExit) as exc:
+        runner.main(['--scimago', '--scopus'])
+    assert exc.value.code == 2
+    with pytest.raises(SystemExit) as exc:
+        runner.main(['--scimago', '--scholar-id', 'one'])
+    assert exc.value.code == 2
 
 
 def test_dry_run_never_writes_or_checks(monkeypatch, capsys):
@@ -168,8 +196,6 @@ def test_dry_run_never_writes_or_checks(monkeypatch, capsys):
     monkeypatch.setattr(postgres, 'build_engine', lambda: engine)
     monkeypatch.setattr(runner, 'read_candidates', lambda *a: [
         journal(), journal('IEEE Access'), journal('Telkom University')])
-    http = MagicMock(side_effect=AssertionError('No HTTP during preview'))
-    monkeypatch.setattr(scopus.requests.sessions.Session, 'request', http)
     ddl = MagicMock(side_effect=AssertionError)
     checks = MagicMock(side_effect=AssertionError)
     monkeypatch.setattr(runner, 'create_table', ddl)
@@ -178,7 +204,6 @@ def test_dry_run_never_writes_or_checks(monkeypatch, capsys):
     ddl.assert_not_called()
     checks.assert_not_called()
     engine.begin.assert_not_called()
-    http.assert_not_called()
     preview = [json.loads(line) for line in capsys.readouterr().out.splitlines()[:-1]]
     assert preview[0]['action'] == 'check_sources'
     assert preview[1]['classification'] == 'ambiguous'
@@ -233,15 +258,16 @@ def test_non_journal_is_excluded_entirely(monkeypatch, title, retry_failed):
 
 
 @pytest.mark.parametrize('title', ['IEEE Access', 'Nature'])
-def test_no_keyword_identity_matching_uses_source_evidence(monkeypatch, title):
+def test_no_keyword_identity_matching_uses_source_evidence(tmp_path, monkeypatch, title):
     candidate = journal(title)
-    # Synthetic API fixture only; this is not a live index assertion about these titles.
-    payload = {'serial-metadata-response': {'entry': [{
-        'dc:title': title, 'source-id': 'test-source', 'prism:aggregationType': 'journal'}]}}
-    positive = scopus.parse_response(candidate, payload)
-    assert positive['status'] == 'indexed' and positive['evidence_url'] == scopus.API
-    payload['serial-metadata-response']['entry'][0]['dc:title'] = title + ' Different'
-    assert scopus.parse_response(candidate, payload)['status'] == 'unverified'
+    # Synthetic master fixture only; this is not a live index assertion about these titles.
+    master = scopus.load_master(write_master(tmp_path, rows={scopus.SHEET_SOURCES: [
+        {'Sourcerecord ID': 'test-source', 'Source Title': title, 'ISSN': '0378-5955',
+         'EISSN': '', 'Active or Inactive': 'Active', 'Coverage': '2010-2026',
+         'Source Type': 'Journal'}]}))
+    positive = master.check(candidate)
+    assert positive['status'] == 'indexed'
+    assert master.check(journal(title + ' Different'))['status'] == 'not_found'
     monkeypatch.setattr(runner, 'SOURCES', {
         'scopus': lambda c: positive,
         'scimagojr': lambda c: result('scimagojr', 'not_found'),
@@ -252,7 +278,7 @@ def test_no_keyword_identity_matching_uses_source_evidence(monkeypatch, title):
     assert counts == {'indexed': 1, 'not_found': 1, 'access_unavailable': 1}
     assert errors == 0
     saved = {call.args[2]['source']: call.args[2] for call in save.call_args_list}
-    assert saved['scopus']['evidence_url'] == scopus.API
+    assert saved['scopus']['status'] == 'indexed'
     assert saved['scimagojr']['indexed'] is None
     assert saved['sinta']['indexed'] is None
 
@@ -262,8 +288,14 @@ def test_all_sources_continue_without_credentials(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     save = MagicMock()
     monkeypatch.setattr(runner, 'save_result', save)
+    def missing_master(*args):
+        raise scimagojr.MasterExportError('SCImagoJR 2025 master CSV not found: fixture.csv')
+    monkeypatch.setattr(scimagojr, 'load_master', missing_master)
+    stub = SimpleNamespace(check=lambda c: result('scopus', 'not_found'))
+    monkeypatch.setattr(scopus, 'load_master', lambda *a, **k: stub)
+    scopus._MASTER_CACHE.clear()
     counts, errors = runner.run_checks(None, [journal()], list(runner.SOURCES), delay=0)
-    assert counts == {'access_unavailable': 3} and errors == 0
+    assert counts == {'not_found': 1, 'error': 1, 'access_unavailable': 1} and errors == 0
     assert save.call_count == 3
 
 
@@ -280,137 +312,31 @@ def test_retry_only_existing_failed_results(monkeypatch):
     assert save.call_count == 1
 
 
-def test_scopus_retry_is_bounded_and_redacted(monkeypatch):
-    monkeypatch.setenv('SCOPUS_API_KEY', 'secret-sentinel')
-    client = MagicMock()
-    client.get.side_effect = scopus.requests.Timeout('secret-sentinel')
-    sleep = MagicMock()
-    checked = scopus.check(journal(), session=client, sleep=sleep)
-    assert checked['status'] == 'access_unavailable'
-    assert client.get.call_count == 3
-    assert [call.args[0] for call in sleep.call_args_list] == [1, 2]
-    assert 'secret-sentinel' not in str(checked)
+def test_scopus_duplicate_identity_and_fuzzy_stay_unverified(tmp_path):
+    master = scopus.load_master(write_master(tmp_path, rows={scopus.SHEET_SOURCES: [
+        {'Sourcerecord ID': '123', 'Source Title': 'Journal of Testing', 'ISSN': '0378-5955',
+         'EISSN': '', 'Active or Inactive': 'Active', 'Coverage': '2000-2026'},
+        {'Sourcerecord ID': '456', 'Source Title': 'Journal of Testing', 'ISSN': '0309-0566',
+         'EISSN': '', 'Active or Inactive': 'Active', 'Coverage': '2000-2026'}]}))
+    checked = master.check(journal('Journal of Testing'))
+    assert checked['status'] == 'needs_verification'
+    assert len(checked['metadata']['candidates']) == 2
+    fuzzy = master.check(journal('Journal of Testings'))
+    assert fuzzy['status'] == 'needs_verification'
+    assert fuzzy['metadata']['match_method'] == 'fuzzy_candidates'
 
 
-def test_scopus_issn_never_falls_back_to_title():
+def test_scopus_issn_match_takes_precedence_over_changed_title(tmp_path):
     candidate = journal()
     candidate.identifiers = {'0378-5955'}
-    payload = {'serial-metadata-response': {'entry': [{
-        'dc:title': candidate.original, 'source-id': 'fixture',
-        'prism:aggregationType': 'journal'}]}}
-    checked = scopus.parse_response(candidate, payload)
-    assert checked['status'] == 'unverified'
-    assert checked['metadata']['identity_match'] is False
-
-
-def test_scopus_partial_title_and_duplicate_identity_are_unverified():
-    entry = {'dc:title': 'Journal of Testing Extended', 'source-id': 'fixture',
-             'prism:aggregationType': 'journal'}
-    payload = {'serial-metadata-response': {'entry': [entry]}}
-    checked = scopus.parse_response(journal(), payload)
-    assert checked['status'] == 'unverified'
-    assert checked['metadata']['results_returned'] == 1
-    entry['dc:title'] = 'Journal of Testing'
-    payload['serial-metadata-response']['entry'].append(dict(entry, **{'source-id': 'other'}))
-    checked = scopus.parse_response(journal(), payload)
-    assert checked['status'] == 'unverified'
-    assert checked['metadata']['match_count'] == 2
-
-
-def test_scopus_http_diagnostics_and_optional_token(monkeypatch):
-    monkeypatch.setenv('SCOPUS_API_KEY', 'secret-key')
-    monkeypatch.setenv('SCOPUS_INST_TOKEN', 'secret-token')
-    client = MagicMock()
-    client.get.return_value.status_code = 200
-    client.get.return_value.json.return_value = {'serial-metadata-response': {'entry': []}}
-    checked = scopus.check(journal(), session=client)
-    assert checked['status'] == 'not_found'
-    assert checked['metadata']['http_status'] == 200
-    assert checked['metadata']['api_success'] is True
-    assert checked['metadata']['results_returned'] == 0
-    assert 'content' not in client.get.call_args.kwargs['params']
-    assert 'X-ELS-Insttoken' not in client.get.call_args.kwargs['headers']
-    scopus.check(journal(), session=client, use_inst_token=True)
-    assert client.get.call_args.kwargs['headers']['X-ELS-Insttoken'] == 'secret-token'
-    assert 'secret-' not in str(checked)
-
-
-def test_check_scopus_without_key_reports_unavailable_without_http(monkeypatch, capsys):
-    monkeypatch.setenv('SCOPUS_API_KEY', ' ')
-    import src.loading.postgres as postgres
-    engine = MagicMock()
-    engine.url.database = 'test_db'
-    engine.connect.return_value.__enter__.return_value.execute.return_value.scalar_one.return_value = 'test_db'
-    monkeypatch.setenv('POSTGRES_DB', 'test_db')
-    monkeypatch.setattr(postgres, 'build_engine', lambda: engine)
-    monkeypatch.setattr(runner, 'read_candidates', lambda *a: [journal()])
-    monkeypatch.setattr(runner.time, 'sleep', lambda _: None)
-    http = MagicMock(side_effect=AssertionError('No API without key'))
-    monkeypatch.setattr(scopus.requests.Session, 'get', http)
-    assert runner.main(['--check-scopus']) == 0
-    report = json.loads(capsys.readouterr().out)
-    assert report['status'] == 'access_unavailable'
-    assert report['metadata']['request_attempted'] is False
-    http.assert_not_called()
-
-
-def test_check_scopus_caps_two_journals_without_writes(monkeypatch, capsys):
-    import src.loading.postgres as postgres
-    engine = MagicMock()
-    engine.url.database = 'test_db'
-    engine.connect.return_value.__enter__.return_value.execute.return_value.scalar_one.return_value = 'test_db'
-    monkeypatch.setenv('POSTGRES_DB', 'test_db')
-    monkeypatch.setenv('SCOPUS_API_KEY', 'secret-key')
-    monkeypatch.setattr(postgres, 'build_engine', lambda: engine)
-    monkeypatch.setattr(runner, 'read_candidates', lambda *a: [
-        journal('Telkom University'), journal('Unresolved Venue'),
-        journal('Journal A'), journal('Journal B'), journal('Journal C')])
-    check = MagicMock(return_value=result('scopus', 'access_unavailable', metadata={
-        'http_status': 403, 'api_success': False, 'request_attempted': True,
-        'results_returned': None, 'identity_match': None}))
-    monkeypatch.setattr(scopus, 'check', check)
-    monkeypatch.setattr(runner.time, 'sleep', lambda _: None)
-    ddl, save = MagicMock(), MagicMock()
-    monkeypatch.setattr(runner, 'create_table', ddl)
-    monkeypatch.setattr(runner, 'save_result', save)
-    assert runner.main(['--check-scopus', '--limit', '100']) == 0
-    assert [call.args[0].original for call in check.call_args_list] == ['Journal A', 'Journal B']
-    ddl.assert_not_called()
-    save.assert_not_called()
-    engine.begin.assert_not_called()
-    assert 'secret-key' not in capsys.readouterr().out
-
-
-def test_scopus_issn_match_takes_precedence_over_changed_title(monkeypatch):
-    candidate = journal()
-    candidate.identifiers = {'0378-5955'}
-    payload = {'serial-metadata-response': {'entry': [{
-        'dc:title': 'Changed title', 'prism:eIssn': '0378-5955',
-        'source-id': '123', 'prism:aggregationType': 'journal'}]}}
-    checked = scopus.parse_response(candidate, payload)
+    master = scopus.load_master(write_master(tmp_path, rows={scopus.SHEET_SOURCES: [
+        {'Sourcerecord ID': '123', 'Source Title': 'Changed title', 'ISSN': '0378-5955',
+         'EISSN': '', 'Active or Inactive': 'Active', 'Coverage': '2000-2026'}]}))
+    checked = master.check(candidate)
     assert checked['status'] == 'indexed'
     assert checked['metadata']['match_method'] == 'issn'
     assert checked['metadata']['identity_match'] is True
-    monkeypatch.setenv('SCOPUS_API_KEY', 'secret-key')
-    client = MagicMock()
-    client.get.return_value.status_code = 403
-    checked = scopus.check(candidate, session=client)
-    assert client.get.call_args.kwargs['params']['issn'] == '0378-5955'
-    assert 'title' not in client.get.call_args.kwargs['params']
-    assert checked['metadata']['http_status'] == 403
-    assert checked['metadata']['api_success'] is False
-    assert checked['metadata']['results_returned'] is None
-    assert checked['indexed'] is None
-
-
-def test_scopus_title_page_limit_and_malformed_response_are_not_positive():
-    entry = {'dc:title': 'Journal of Testing', 'source-id': '123',
-             'prism:aggregationType': 'journal'}
-    entries = [entry] + [dict(entry, **{'dc:title': 'Other ' + str(i)}) for i in range(24)]
-    checked = scopus.parse_response(journal(), {'serial-metadata-response': {'entry': entries}})
-    assert checked['status'] == 'unverified'
-    assert checked['metadata']['results_returned'] == 25
-    assert scopus.parse_response(journal(), {'serial-metadata-response': {'entry': 'bad'}})['status'] == 'error'
+    assert checked['indexed'] is True
 
 
 def test_check_scopus_cannot_enable_save_or_dry_run():
@@ -418,106 +344,6 @@ def test_check_scopus_cannot_enable_save_or_dry_run():
         with pytest.raises(SystemExit) as exc:
             runner.main(['--check-scopus', mode])
         assert exc.value.code == 2
-
-
-@pytest.mark.parametrize('container', [
-    {'error': 'No results found', 'link': []},
-    {'error': 'No results found for the search query', 'link': []},
-    {'entry': []},
-    {'entry': None, 'error': 'No results found'},
-])
-def test_scopus_valid_empty_responses(container, monkeypatch):
-    monkeypatch.setenv('SCOPUS_API_KEY', 'secret-key')
-    client = MagicMock()
-    client.get.return_value.status_code = 200
-    client.get.return_value.json.return_value = {'serial-metadata-response': container}
-    checked = scopus.check(journal(), session=client)
-    assert checked['status'] == 'not_found'
-    assert checked['indexed'] is None
-    assert checked['metadata']['results_returned'] == 0
-    assert checked['metadata']['identity_match'] is False
-    assert checked['metadata']['http_status'] == 200
-    assert checked['metadata']['api_success'] is True
-
-
-@pytest.mark.parametrize('payload', [None, [], {},
-    {'serial-metadata-response': []},
-    {'serial-metadata-response': {}},
-    {'serial-metadata-response': {'entry': None}},
-    {'serial-metadata-response': {'entry': [None]}},
-    {'serial-metadata-response': {'entry': {'dc:title': 42}}},
-    {'serial-metadata-response': {'entry': {'dc:title': ''}}},
-    {'serial-metadata-response': {'entry': {'dc:title': 'Journal of Testing', 'prism:issn': []}}},
-    {'serial-metadata-response': {'entry': {'dc:title': 'Journal of Testing', 'source-id': {'token': 'secret-sentinel'}}}},
-    {'serial-metadata-response': {'error': 'Unknown failure secret-sentinel'}},
-    {'serial-metadata-response': {'error': {'statusText': 'secret-sentinel'}}},
-    {'serial-metadata-response': {'error': 'No results found', 'entry': 'invalid'}},
-    {'serial-metadata-response': {'error': 'No results found', 'entry': [{'dc:title': 'Journal of Testing'}]}},
-])
-def test_scopus_invalid_payloads_fail_closed(payload, caplog):
-    checked = scopus.parse_response(journal(), payload)
-    assert checked['status'] == 'error'
-    assert checked['indexed'] is None
-    assert checked['metadata']['results_returned'] is None
-    assert 'secret-sentinel' not in str(checked) + caplog.text
-
-
-@pytest.mark.parametrize('as_list', [False, True])
-def test_scopus_documented_entry_forms(as_list):
-    candidate = journal()
-    candidate.identifiers = {'0378-5955'}
-    entry = {'dc:title': candidate.original, 'prism:issn': '0378-5955',
-             'prism:aggregationType': 'journal', 'source-id': '123'}
-    payload = {'serial-metadata-response': {'entry': [entry] if as_list else entry}}
-    checked = scopus.parse_response(candidate, payload)
-    assert checked['status'] == 'indexed'
-    assert checked['metadata']['identity_match'] is True
-    assert checked['metadata']['match_method'] == 'issn'
-
-
-def test_scopus_title_encoding_and_safe_diagnostics(monkeypatch, caplog):
-    from urllib.parse import parse_qs, urlsplit
-    import logging
-    monkeypatch.setenv('SCOPUS_API_KEY', 'secret-key-sentinel')
-    monkeypatch.setenv('SCOPUS_INST_TOKEN', 'secret-token-sentinel')
-    candidate = journal('Journal of Information Systems Engineering & Business Intelligence')
-    client = MagicMock()
-    client.get.return_value.status_code = 200
-    client.get.return_value.json.return_value = {'serial-metadata-response': {'error': 'No results found'}}
-    with caplog.at_level(logging.INFO, logger=scopus.__name__):
-        checked = scopus.check(candidate, session=client, use_inst_token=True)
-    params = client.get.call_args.kwargs['params']
-    prepared = scopus.requests.Request('GET', scopus.API, params=params).prepare()
-    assert '%26' in prepared.url
-    assert '%2526' not in prepared.url
-    assert parse_qs(urlsplit(prepared.url).query)['title'] == [candidate.original]
-    assert set(params) == {'title', 'count', 'view'}
-    assert checked['metadata']['query_type'] == 'title'
-    assert checked['metadata']['query_parameters'] == params
-    assert checked['status'] == 'not_found' and checked['indexed'] is None
-    assert 'not evidence' in checked['reason']
-    assert 'query_type' in caplog.text and 'results_returned' in caplog.text
-    assert 'identity_match' in caplog.text and 'http_status' in caplog.text
-    for secret in ('secret-key-sentinel', 'secret-token-sentinel', 'X-ELS-APIKey', 'X-ELS-Insttoken'):
-        assert secret not in caplog.text + str(checked['metadata'])
-
-
-def test_scopus_issn_diagnostics_and_404_is_not_empty_search(monkeypatch, caplog):
-    import logging
-    monkeypatch.setenv('SCOPUS_API_KEY', 'secret-key-sentinel')
-    candidate = journal()
-    candidate.identifiers = {'0378-5955'}
-    client = MagicMock()
-    client.get.return_value.status_code = 404
-    with caplog.at_level(logging.INFO, logger=scopus.__name__):
-        checked = scopus.check(candidate, session=client)
-    assert checked['status'] == 'unverified'
-    assert checked['metadata']['query_type'] == 'issn'
-    assert checked['metadata']['query_parameters']['issn'] == '0378-5955'
-    assert 'title' not in checked['metadata']['query_parameters']
-    assert checked['metadata']['results_returned'] is None
-    assert checked['metadata']['http_status'] == 404
-    assert 'secret-key-sentinel' not in caplog.text
 
 
 @pytest.mark.parametrize('adapter', [scimagojr, sinta], ids=['scimagojr', 'sinta'])
@@ -540,7 +366,7 @@ def test_manual_evidence_requires_title_and_available_issn(adapter, title, has_i
         monkeypatch.setenv('SINTA_PASSWORD', 'fixture-password')
         evidence['evidence_url'] = 'https://sinta.kemdiktisaintek.go.id/journals/profile/123'
     monkeypatch.setattr(adapter, 'read_evidence', lambda *a: [evidence])
-    checked = adapter.check(candidate)
+    checked = (adapter.check_manual_evidence(candidate) if adapter is scimagojr else adapter.check(candidate))
     assert checked['status'] == expected
     assert checked['indexed'] is (True if expected == 'indexed' else None)
     if expected == 'indexed':
@@ -551,12 +377,13 @@ def test_manual_evidence_requires_title_and_available_issn(adapter, title, has_i
             assert checked['sinta_period'] == '2023-2027'
 
 
-def test_manual_title_rule_does_not_change_general_or_scopus_issn_matching():
+def test_manual_title_rule_does_not_change_general_or_scopus_issn_matching(tmp_path):
     candidate = journal()
     candidate.identifiers = {'0378-5955'}
     assert matches(candidate, 'Different Journal', ['0378-5955']) is True
-    checked = scopus.parse_response(candidate, {'serial-metadata-response': {'entry': [{
-        'dc:title': 'Different Journal', 'prism:eIssn': '0378-5955',
-        'prism:aggregationType': 'journal', 'source-id': '123'}]}})
+    master = scopus.load_master(write_master(tmp_path, rows={scopus.SHEET_SOURCES: [
+        {'Sourcerecord ID': '123', 'Source Title': 'Different Journal', 'ISSN': '0378-5955',
+         'EISSN': '', 'Active or Inactive': 'Active', 'Coverage': '2000-2026'}]}))
+    checked = master.check(candidate)
     assert checked['status'] == 'indexed'
     assert checked['metadata']['identity_match'] is True

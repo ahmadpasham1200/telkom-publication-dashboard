@@ -177,7 +177,7 @@ def test_run_pipeline_load_core_membuka_koneksi(monkeypatch, tmp_path):
 def test_run_pipeline_parse_args_default_referensi_dosen():
     """Default --referensi-dosen menunjuk ke Excel daftar dosen."""
     args = run_pipeline.parse_args(["--id", "X"])
-    assert args.referensi_dosen == "data dosen/Data dosen.xlsx"
+    assert args.referensi_dosen == "data/dosen/Data dosen.xlsx"
     # Path eksplisit dari user dihormati.
     args = run_pipeline.parse_args(
         ["--id", "X", "--referensi-dosen", "lain.xlsx"])
@@ -226,11 +226,14 @@ def test_run_pipeline_referensi_dosen_diteruskan_ke_loader(tmp_path,
     rc = run_pipeline.main(["--id", "ID_A", "--referensi-dosen", xlsx])
 
     assert rc == 0
+    # baca_daftar sekarang additive menambahkan kunci `status` (roster
+    # incremental); loader hanya memakai nama/scholar_id/prodi, jadi
+    # perilaku referensi tidak berubah.
     assert tercatat["baris_referensi"] == [
         {"no": 1, "nama": "Budi Santoso", "scholar_id": "ID_A",
-         "prodi": ""},
+         "prodi": "", "status": ""},
         {"no": 2, "nama": "Siti Aminah", "scholar_id": "ID_B",
-         "prodi": ""},
+         "prodi": "", "status": ""},
     ]
     assert tercatat["scholar_id"] == "ID_A"
 
@@ -411,3 +414,65 @@ def test_run_pipeline_gagal_load_tidak_cetak_sukses_palsu(tmp_path,
     # Tidak ada ringkasan sukses / blok AUTHOR untuk transaksi gagal.
     assert "AUTHOR (RAW)" not in keluaran
     assert "Baris masuk core" not in keluaran
+
+# ============================================================
+# RATE_LIMITED (HTTP 429): exit code 3, bukan 2
+# ============================================================
+
+def test_run_pipeline_rate_limited_exit_3(tmp_path, monkeypatch):
+    """Statistik status RATE_LIMITED -> main() mengembalikan 3 (BUKAN 2).
+
+    TAHAP 2 tetap dijalankan lebih dulu (load_scholar_run dipanggil ->
+    envelope tersimpan di raw, termasuk data parsial bila ada); exit
+    code baru diputuskan di ringkasan."""
+    tercatat = {}
+    _pasang_patch(monkeypatch, tercatat, statistik={
+        "status": "RATE_LIMITED", "raw_result_id": 7, "run_id": None,
+    })
+
+    rc = run_pipeline.main([
+        "--id", "X",
+        "--referensi-dosen", str(tmp_path / "hilang.xlsx"),
+    ])
+
+    assert rc == 3
+    # TAHAP 2 (penyimpanan raw) SUDAH dijalankan sebelum pemetaan
+    # exit code: loader menerima envelope dengan scholar_id X.
+    assert tercatat["scholar_id"] == "X"
+
+
+def test_run_pipeline_fatal_lain_tetap_exit_2(tmp_path, monkeypatch):
+    """Fatal lain (BLOCKED/TIMEOUT/NO_DATA/PARSING_ERROR) tetap exit 2;
+    hanya RATE_LIMITED yang mendapat kode 3."""
+    for status in ("BLOCKED", "TIMEOUT", "NO_DATA", "PARSING_ERROR"):
+        tercatat = {}
+        _pasang_patch(monkeypatch, tercatat, statistik={
+            "status": status, "raw_result_id": 1, "run_id": None,
+        })
+
+        rc = run_pipeline.main([
+            "--id", "X",
+            "--referensi-dosen", str(tmp_path / "hilang.xlsx"),
+        ])
+
+        assert rc == 2, status
+
+
+def test_run_pipeline_loaded_raw_only_skipped_tetap_exit_0(
+        tmp_path, monkeypatch):
+    """Loaded / raw-only / skipped tetap exit 0 - tidak berubah oleh
+    penambahan RATE_LIMITED."""
+    for status in (run_pipeline.STATUS_LOADED,
+                   run_pipeline.STATUS_RAW_ONLY,
+                   run_pipeline.STATUS_SKIPPED):
+        tercatat = {}
+        _pasang_patch(monkeypatch, tercatat, statistik={
+            "status": status, "raw_result_id": 1, "run_id": None,
+        })
+
+        rc = run_pipeline.main([
+            "--id", "X",
+            "--referensi-dosen", str(tmp_path / "hilang.xlsx"),
+        ])
+
+        assert rc == 0, status

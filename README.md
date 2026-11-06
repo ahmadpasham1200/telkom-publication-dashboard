@@ -6,6 +6,11 @@ Scraper menggunakan Playwright (Chromium) dan BeautifulSoup. Secara default, run
 
 ## Alur utama
 
+Audit, mapping kolom, struktur JSONB, batasan metadata, dan hasil pengujian
+tersedia dalam [Audit 17 field Google Scholar → RAW](docs/guides/audit-17-field-google-scholar.md).
+Loader terbaru memerlukan migration aditif `sql/ddl/15_add_raw_scholar_detail_fields.sql`
+sebelum scraping yang menulis RAW; migration tidak dijalankan otomatis pada database lama.
+
 1. Runner menerima ID profil, atau membaca daftar ID dari Excel untuk mode batch.
 2. Scraper mengambil profil dan daftar publikasi, kemudian mencoba mengambil halaman detail setiap publikasi (kecuali `--tanpa-detail` pada runner satu profil).
 3. Hasil dikemas sebagai envelope: identitas run, status, waktu, data, dan informasi kegagalan.
@@ -112,7 +117,7 @@ python -m src.pipeline.run_pipeline --id SCHOLAR_ID_ANDA --tanpa-detail
 | `--batch` | Batas klik "Tampilkan lainnya", default 60; bukan jumlah profil |
 | `--tampil` | Batas baris tabel di terminal, default 20; gunakan 0 untuk tidak mencetak |
 | `--diam` | Mengurangi progress scraper, bukan seluruh ringkasan |
-| `--referensi-dosen` | Excel referensi identitas; default `data dosen/Data dosen.xlsx` |
+| `--referensi-dosen` | Excel referensi identitas; default `data/dosen/Data dosen.xlsx` |
 | `--raw-only` | Menegaskan mode default, berhenti setelah RAW |
 | `--load-core` | Opsi lanjutan untuk transformasi/loading STAGING/CORE; bukan alur utama |
 | `--url` | Tersedia pada parser, tetapi bukan pengganti konfigurasi koneksi RAW; lihat batasan di bawah |
@@ -125,10 +130,10 @@ Referensi Excel yang tidak ada/tidak terbaca menonaktifkan verifikasi identitas 
 
 ## Scraping batch dari Excel
 
-Sediakan workbook lokal, misalnya `data dosen/Data dosen.xlsx`. Kolom `scholar_id` wajib ada; gunakan juga header `no`, `nama`, dan opsional `prodi`. Header dibaca tanpa membedakan huruf besar/kecil. Kode memilih `Sheet1` bila tersedia, selain itu sheet pertama. Baris yang seluruhnya kosong dilewati; baris data tanpa ID dicatat `DILEWATI`. Kolom `nama` dan ID menjadi referensi verifikasi identitas, sedangkan `prodi` hanya pelengkap.
+Sediakan workbook lokal, misalnya `data/dosen/Data dosen.xlsx`. Kolom `scholar_id` wajib ada; gunakan juga header `no`, `nama`, dan opsional `prodi`. Header dibaca tanpa membedakan huruf besar/kecil. Kode memilih `Sheet1` bila tersedia, selain itu sheet pertama. Baris yang seluruhnya kosong dilewati; baris data tanpa ID dicatat `DILEWATI`. Kolom `nama` dan ID menjadi referensi verifikasi identitas, sedangkan `prodi` hanya pelengkap.
 
 ```sh
-python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut
+python src/pipeline/run_batch.py --file "data/dosen/Data dosen.xlsx" --lanjut
 ```
 
 Bentuk modul `python -m src.pipeline.run_batch` juga tersedia. Batch memakai file `--file` sebagai referensi identitas bagi runner satu profil.

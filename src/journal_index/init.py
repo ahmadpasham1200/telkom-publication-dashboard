@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
 STATUSES = {'indexed', 'not_indexed', 'not_found', 'unverified',
-            'access_unavailable', 'error'}
+            'access_unavailable', 'error', 'excluded'}
 
 
 def normalize_title(value):
@@ -51,20 +51,41 @@ class Candidate:
     identifiers: set = field(default_factory=set)
 
 
-def candidates(rows, limit=20):
+def classify_scholar_publication(row):
+    publication_type = (row.get('detail_publication_type') or '').strip().casefold()
+    venue_label = normalize_title(row.get('detail_venue_label'))
+    if publication_type in ('conference', 'proceedings', 'book', 'book_chapter',
+                            'thesis', 'dissertation', 'non_journal'):
+        return 'non_journal', 'Explicit non-journal publication type: ' + publication_type
+    if venue_label in ('conference', 'konferensi', 'proceedings', 'prosiding', 'book', 'buku',
+                       'book chapter', 'bab buku', 'thesis', 'dissertation', 'tesis', 'disertasi', 'skripsi'):
+        return 'non_journal', 'Explicit non-journal Scholar venue label: ' + venue_label
+    if publication_type == 'journal' or (row.get('detail_journal') or '').strip():
+        return 'journal', 'Explicit Scholar journal metadata'
+    if venue_label in ('journal', 'jurnal'):
+        return 'journal', 'Explicit Scholar journal venue label preserved in RAW envelope'
+    return 'ambiguous', 'Scholar publication type is unknown; journal identity not established'
+
+
+def candidates(rows, limit=20, *, scholar_types=False):
     grouped = {}
     for row in rows:
-        title = (row.get('detail_venue') or '').strip() or (row.get('venue') or '').strip()
-        if not title:
+        title = ((row.get('detail_journal') or '').strip() if scholar_types else '')
+        title = title or (row.get('detail_venue') or '').strip() or (row.get('venue') or '').strip()
+        if not title and not scholar_types:
             continue
         key = normalize_title(title)
-        if not key:
+        if not key and not scholar_types:
             continue
+        kind, reason = classify(title)
+        if scholar_types:
+            kind, reason = classify_scholar_publication(row)
+            # Do not mix excluded/unknown origins into a verified journal candidate.
+            key = (key, kind)
         if key not in grouped:
             if len(grouped) >= limit:
                 continue
-            kind, reason = classify(title)
-            grouped[key] = Candidate(title, key, kind, reason)
+            grouped[key] = Candidate(title, normalize_title(title), kind, reason)
         candidate = grouped[key]
         # Only explicitly identified ISSN fields, never numbers in a DOI/URL.
         for field_name in ('issn', 'eissn', 'detail_issn', 'detail_eissn'):
@@ -72,7 +93,9 @@ def candidates(rows, limit=20):
         # Preserve every observed spelling and origin within the bounded source window.
         candidate.publications.append({k: row.get(k) for k in (
             'raw_publication_id', 'scholar_id', 'title', 'venue', 'detail_venue',
-            'publication_year', 'detail_doi', 'detail_url')})
+            'publication_year', 'detail_doi', 'detail_url',
+            'detail_journal', 'detail_publication_type',
+            'issn', 'eissn', 'detail_issn', 'detail_eissn', 'detail_venue_label')})
     return list(grouped.values())
 
 

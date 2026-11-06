@@ -2197,8 +2197,11 @@ def test_kolom_raw_publication_cakupan_lengkap_25_kolom():
     from src.loading.postgres import (
         KOLOM_RAW_PUBLICATION, RAW_SCHOLAR_PUBLICATION)
 
-    assert KOLOM_RAW_PUBLICATION == KOLOM_RAW_PUBLICATION_DIHARAPKAN
-    assert len(KOLOM_RAW_PUBLICATION) == 25
+    tambahan = ('detail_journal', 'detail_conference', 'detail_book',
+                'detail_publication_type', 'detail_extraction_status',
+                'detail_cited_by', 'detail_related_articles', 'detail_all_versions')
+    assert tuple(k for k in KOLOM_RAW_PUBLICATION if k not in tambahan) == KOLOM_RAW_PUBLICATION_DIHARAPKAN
+    assert len(KOLOM_RAW_PUBLICATION) == 33
     # Keanggotaan wajib dalam SATU cakupan
     assert "detail_doi" in KOLOM_RAW_PUBLICATION
     for kolom in ("profile_volume", "profile_issue", "profile_pages"):
@@ -2235,7 +2238,7 @@ def test_stmt_sisip_raw_publication_sumber_ke_target_end_to_end():
 
     # (e) Konsistensi kolom-param: 25 data + 3 identitas, tanpa
     # param kolom data ekstra.
-    assert len(compiled.params) == 25 + 3
+    assert len(compiled.params) == 33 + 3
     assert set(compiled.params) == (
         set(KOLOM_RAW_PUBLICATION) | {"result_id", "urutan", "scholar_id"})
 

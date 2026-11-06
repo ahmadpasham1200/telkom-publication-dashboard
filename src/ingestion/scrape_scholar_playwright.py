@@ -29,7 +29,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urljoin, parse_qs
 
 # ------------------------------------------------------------
 # Setting Unicode output (Windows default cp1252 bisa crash
@@ -49,6 +49,9 @@ for _stream in (sys.stdout, sys.stderr):
 SCHOLAR_ID_DEFAULT = "8kDg_v4AAAAJ"
 
 # Nilai status yang mungkin dikembalikan oleh scrape_scholar().
+# RATE_LIMITED = HTTP 429 teramati (navigasi awal / paging / detail):
+# sinyal first-class supaya pemanggil batch tahu WAJIB menghentikan
+# seluruh batch - bukan timeout biasa, bukan sekadar partial.
 RUN_STATUSES = (
     "SUCCESS",
     "PARTIAL_SUCCESS",
@@ -56,6 +59,7 @@ RUN_STATUSES = (
     "TIMEOUT",
     "NO_DATA",
     "PARSING_ERROR",
+    "RATE_LIMITED",
 )
 
 # Domain Scholar. Kalau domain ini kena blokir, ganti manual ke salah
@@ -79,13 +83,13 @@ USER_AGENT = (
 )
 
 TIMEOUT_MS = 20000
-JITTER_MIN = 1.5
-JITTER_MAX = 3.5
+JITTER_MIN = 15.0
+JITTER_MAX = 25.0
 
 # Jeda antar pengambilan halaman detail (lebih lebar dari jitter
 # paging karena tiap publikasi = satu navigasi tambahan).
-JITTER_DETAIL_MIN = 2.0
-JITTER_DETAIL_MAX = 5.0
+JITTER_DETAIL_MIN = 20.0
+JITTER_DETAIL_MAX = 30.0
 
 # Kunci field halaman detail yang digabung ke tiap baris rows[].
 DETAIL_KEYS = (
@@ -93,6 +97,9 @@ DETAIL_KEYS = (
     "detail_venue_label", "detail_volume", "detail_issue", "detail_pages",
     "detail_publisher", "detail_description", "detail_citations",
     "detail_link", "detail_pdf_link", "detail_doi",
+    "detail_journal", "detail_conference", "detail_book",
+    "detail_publication_type", "detail_extraction_status",
+    "detail_cited_by", "detail_related_articles", "detail_all_versions",
 )
 
 
@@ -106,9 +113,12 @@ def _utc_now_iso():
 
 
 def _classify_status(*, has_data, blocked, network_error, parse_error,
-                     expected_empty, partial):
+                     expected_empty, partial, rate_limited=False):
     """Tentukan status run. Urutan evaluasi: first match wins.
 
+    0. rate_limited (HTTP 429 teramati, apa pun fasenya) -> RATE_LIMITED
+       (precedence TERTINGGI: sinyal untuk pemanggil batch berhenti
+       seluruh batch, menang atas blocked/network_error/partial)
     1. fatal, tanpa data, captcha/unusual traffic  -> BLOCKED
     2. fatal, tanpa data, nav error / timeout      -> TIMEOUT
     3. fatal, tanpa data, parse HTML melempar error -> PARSING_ERROR
@@ -116,6 +126,8 @@ def _classify_status(*, has_data, blocked, network_error, parse_error,
     5. ada data, sebagian gagal / paging terpotong -> PARTIAL_SUCCESS
     6. ada data, semua lancar                      -> SUCCESS
     """
+    if rate_limited:
+        return "RATE_LIMITED"
     if not has_data:
         if blocked:
             return "BLOCKED"
@@ -619,9 +631,9 @@ def _ekstrak_sitasi_dari_blok(nilai_tag):
             continue
         if anchor.find_parent(id="gsc_oci_graph_wrapper") is not None:
             continue
-        cocok = re.search(r"\d+", anchor.get_text())
+        cocok = re.search(r"\d[\d,.\s\u00a0]*", anchor.get_text())
         # Anchor pertama yang cocok dipakai; tanpa angka -> None.
-        return cocok.group(0) if cocok else None
+        return re.sub(r"\D", "", cocok.group(0)) if cocok else None
     return None
 
 
@@ -635,19 +647,107 @@ def _ekstrak_sitasi_dari_blok(nilai_tag):
 # live) dan ditambahkan sebagai dukungan bilingual. Sengaja DITOLAK:
 #   - "number": ambigu (bisa berarti hitungan apa pun; Scholar Inggris
 #     memakai "Issue" untuk terbitan),
-#   - "book"/"series": makna berbeda dari venue dan tidak boleh ikut
-#     menentukan kategori -> tidak dipetakan ke detail_venue MAUPUN
-#     detail_venue_label (risiko salah klasifikasi).
+#   - "series": tidak cukup bukti untuk menentukan jenis publikasi.
+# Label Book dan jenis venue spesifik ditangani oleh VENUE_FIELDS.
 LABEL_DETAIL = {
-    "detail_authors": ("pengarang", "penulis", "author(s)"),
+    "detail_authors": ("pengarang", "penulis", "author(s)", "authors", "author"),
     "detail_date": ("tanggal terbit", "publication date", "date"),
     "detail_venue": ("jurnal", "konferensi", "journal", "conference", "venue"),
     "detail_volume": ("jilid", "volume", "vol"),
     "detail_issue": ("terbitan", "issue", "nomor"),
     "detail_pages": ("halaman", "pages", "page", "page range"),
     "detail_publisher": ("penerbit", "publisher"),
-    "detail_citations": ("total kutipan", "cited by"),
+    "detail_citations": ("total kutipan", "cited by", "total citations"),
+    "detail_doi": ("doi",),
 }
+
+# Explicit source labels only; a title or publisher alone is not type evidence.
+VENUE_FIELDS = {
+    'journal': ('detail_journal', 'journal'), 'jurnal': ('detail_journal', 'journal'),
+    'conference': ('detail_conference', 'conference'),
+    'konferensi': ('detail_conference', 'conference'),
+    'proceedings': ('detail_conference', 'conference'),
+    'prosiding': ('detail_conference', 'conference'),
+    'book': ('detail_book', 'book'), 'buku': ('detail_book', 'book'),
+    'book chapter': ('detail_book', 'book_chapter'),
+    'bab buku': ('detail_book', 'book_chapter'),
+    'thesis': ('detail_venue', 'thesis'), 'dissertation': ('detail_venue', 'thesis'),
+    'tesis': ('detail_venue', 'thesis'), 'disertasi': ('detail_venue', 'thesis'),
+    'skripsi': ('detail_venue', 'thesis'),
+}
+
+RELATION_FIELDS = {
+    'cited by': 'detail_cited_by', 'artikel yang menyitasi': 'detail_cited_by',
+    'related articles': 'detail_related_articles', 'artikel terkait': 'detail_related_articles',
+    'all versions': 'detail_all_versions', 'semua versi': 'detail_all_versions',
+}
+
+
+def _parse_relations(soup, base_url):
+    """Collect links already present in the DOM, without fetching targets.
+
+    Collection links have no article title: their text is stored as label.
+    NULL fields and explicit availability avoid inventing citing articles.
+    """
+    result = {key: {'status': 'unavailable', 'items': []} for key in (
+        'detail_cited_by', 'detail_related_articles', 'detail_all_versions')}
+    for field in soup.select('.gsc_oci_field'):
+        key = RELATION_FIELDS.get(_norm_label(field.get_text()))
+        if key:
+            # A displayed relation field without a usable reference is distinct
+            # from a field absent from the source altogether.
+            result[key]['status'] = 'extraction_error'
+    for anchor in soup.select('a'):
+        if anchor.find_parent(id='gsc_oci_graph_wrapper') is not None:
+            continue
+        href = anchor.get('href') or ''
+        try:
+            query = parse_qs(urlsplit(href).query)
+        except ValueError:
+            href, query = '', {}
+        label = anchor.get_text(' ', strip=True)
+        normalized = _norm_label(label)
+        related_query = query.get('q', [''])[0]
+        identifier = query.get('cites', query.get('cluster', [None]))[0]
+        if identifier is None and related_query.startswith('related:'):
+            identifier = related_query
+        block = anchor.find_parent(class_='gs_scl')
+        field = block.select_one('.gsc_oci_field') if block else None
+        field_label = _norm_label(field.get_text()) if field else ''
+        key = RELATION_FIELDS.get(field_label)
+        navigation_label = (
+            normalized in RELATION_FIELDS
+            or re.match(r'^(cited by|dirujuk|dikutip|all \d+ versions|semua \d+ versi)', normalized)
+        )
+        article_title = (label or None) if key and not navigation_label else None
+        # Explicit relation context describes the link's role. A cluster URL
+        # can identify an article in a Related articles block too.
+        if key is None:
+            if 'cites' in query or re.match(r'^(cited by|dirujuk|dikutip)', normalized):
+                key = 'detail_cited_by'
+            elif related_query.startswith('related:') or normalized in ('related articles', 'artikel terkait'):
+                key = 'detail_related_articles'
+            elif 'cluster' in query or re.match(r'^(all \d+ versions|semua \d+ versi)', normalized):
+                key = 'detail_all_versions'
+        if key is None:
+            continue
+        try:
+            url = urljoin(base_url, href) if href else None
+            if url and urlsplit(url).scheme not in ('http', 'https'):
+                url = None
+        except ValueError:
+            url = None
+        if not url and not identifier:
+            if not result[key]['items']:
+                result[key]['status'] = 'extraction_error'
+            continue
+        item = {'title': article_title,
+                'label': label or None, 'url': url, 'identifier': identifier}
+        # No title inferred from navigation labels. Bound work to this page.
+        if item not in result[key]['items'] and len(result[key]['items']) < 100:
+            result[key]['items'].append(item)
+        result[key]['status'] = 'available'
+    return result
 
 # Label yang ikut menentukan kategori tipe venue (detail_venue_label
 # menyimpan teks label ASLI). "venue" sengaja TIDAK di sini: itu nama
@@ -680,7 +780,23 @@ def _norm_label(teks):
     return " ".join(teks.split()).lower()
 
 
-def parse_detail_html(html):
+def normalisasi_judul(teks):
+    """Normalisasi judul UNTUK PERBANDINGAN saja (bukan penyimpanan).
+
+    Lowercase, NBSP/whitespace dirapikan, tanda baca diganti spasi.
+    Dua judul dianggap sama hanya bila hasil normalisasinya PERSIS
+    sama (exact match setelah normalisasi) - TIDAK ada pencocokan
+    fuzzy. Nilai judul asli yang disimpan di baris TIDAK pernah
+    diubah oleh fungsi ini.
+    """
+    if not isinstance(teks, str):
+        return ""
+    rendah = teks.replace("\xa0", " ").lower()
+    tanpa_tanda = re.sub(r"[^\w\s]", " ", rendah)
+    return re.sub(r"\s+", " ", tanpa_tanda).strip()
+
+
+def parse_detail_html(html, base_url='https://scholar.google.com'):
     """Parse halaman detail publikasi menjadi dict field detail.
 
     Field diambil dari pasangan div.gs_scl (label div.gsc_oci_field +
@@ -698,10 +814,11 @@ def parse_detail_html(html):
         journal/conference/venue, volume/vol, issue/nomor,
         pages/page/page range, publisher, cited by.
 
-    Sengaja DITOLAK: "number" (ambigu - bisa berarti hitungan apa pun;
-    Scholar Inggris memakai "Issue" untuk terbitan), "book" dan "series"
-    (makna berbeda dari venue; TIDAK dipetakan ke detail_venue maupun
-    detail_venue_label karena risiko salah klasifikasi kategori).
+    Venue bertipe eksplisit dipisah ke detail_journal/conference/book;
+    detail_venue tetap menyimpan sumber asli. Jenis tanpa bukti tetap
+    unknown. Number dan Series tidak dipakai sebagai bukti tipe.
+    Relasi hanya dikumpulkan dari halaman ini (maksimal 100 per jenis),
+    tanpa membuka URL tujuan; base_url mempertahankan domain Scholar.
 
     KECUALI `detail_citations`: nilainya diambil dari struktur DOM lewat
     _ekstrak_sitasi_dari_blok (angka pada anchor 'cites=' di luar graph
@@ -723,7 +840,7 @@ def parse_detail_html(html):
 
     def _teks(selector):
         el = soup.select_one(selector)
-        return el.get_text(strip=True) if el else None
+        return (el.get_text(' ', strip=True) or None) if el else None
 
     hasil = {
         "detail_title": _teks("#gsc_oci_title"),
@@ -741,6 +858,13 @@ def parse_detail_html(html):
         "detail_pdf_link": None,
         "detail_doi": None,
     }
+    hasil = {**_detail_kosong(), **hasil}
+    recognized = bool(soup.select_one('#gsc_oci_title, .gsc_oci_field'))
+    hasil['detail_extraction_status'] = 'parsed' if recognized else 'unrecognized_html'
+    if recognized:
+        hasil['detail_publication_type'] = 'unknown'
+        hasil.update(_parse_relations(soup, base_url))
+    publication_types = set()
 
     link = soup.select_one("a.gsc_oci_title_link")
     if link is not None:
@@ -754,12 +878,28 @@ def parse_detail_html(html):
     # LABEL_DETAIL; lihat docstring utk alias & penolakan). Label venue-
     # tipe (LABEL_VENUE_TIPE) menyimpan teks label ASLI di
     # detail_venue_label sebagai pembeda tipe utk turunan kategori.
-    for blok in soup.select("div.gs_scl"):
-        label = blok.select_one("div.gsc_oci_field")
-        nilai = blok.select_one("div.gsc_oci_value")
-        if label is None or nilai is None:
+    for label in soup.select(".gsc_oci_field"):
+        # Pair only with this field's sibling, never a descendant of some
+        # unrelated row when the expected value element is missing.
+        nilai = label.find_next_sibling()
+        if nilai is None or 'gsc_oci_value' not in nilai.get('class', []):
             continue
         teks_label = _norm_label(label.get_text())
+        value = nilai.get_text(' ', strip=True)
+        venue_field = VENUE_FIELDS.get(teks_label)
+        if teks_label in ('publication type', 'jenis publikasi'):
+            explicit_type = _norm_label(value)
+            if explicit_type in VENUE_FIELDS:
+                publication_types.add(VENUE_FIELDS[explicit_type][1])
+            elif explicit_type in ('doctoral dissertation', 'masters thesis', "master's thesis"):
+                publication_types.add('thesis')
+        if venue_field and value:
+            column, publication_type = venue_field
+            hasil[column] = value
+            publication_types.add(publication_type)
+            if hasil['detail_venue'] is None:
+                hasil['detail_venue'] = value
+                hasil['detail_venue_label'] = label.get_text(strip=True)
         kunci = _PEMETAAN_LABEL.get(teks_label)
         if kunci is not None:
             if kunci == "detail_citations":
@@ -767,7 +907,7 @@ def parse_detail_html(html):
                 # wrapper (bukan gabungan teks blok seperti tahun/bar).
                 hasil[kunci] = _ekstrak_sitasi_dari_blok(nilai)
             else:
-                teks_nilai = nilai.get_text(strip=True)
+                teks_nilai = nilai.get_text(' ', strip=True)
                 if teks_nilai:  # value kosong -> tetap None
                     hasil[kunci] = teks_nilai
             if teks_label in LABEL_VENUE_TIPE:
@@ -782,23 +922,29 @@ def parse_detail_html(html):
     # Label-label ini TIDAK dimasukkan ke pemetaan supaya tidak
     # menimpa jalur utama.
     if hasil["detail_description"] is None:
-        for blok in soup.select("div.gs_scl"):
-            label = blok.select_one("div.gsc_oci_field")
+        for blok in soup.select(".gs_scl"):
+            label = blok.select_one(".gsc_oci_field")
             if label is None:
                 continue
             if _norm_label(label.get_text()) not in LABEL_DESKRIPSI_FALLBACK:
                 continue
-            nilai = blok.select_one("div.gsc_oci_value")
+            nilai = blok.select_one(".gsc_oci_value")
             if nilai is None:
                 continue
-            teks = nilai.get_text(strip=True)
+            teks = nilai.get_text(' ', strip=True)
             if teks:
                 hasil["detail_description"] = teks
                 break
 
+    if publication_types:
+        if publication_types <= {'book', 'book_chapter'}:
+            hasil['detail_publication_type'] = 'book_chapter' if 'book_chapter' in publication_types else 'book'
+        else:
+            hasil['detail_publication_type'] = next(iter(publication_types)) if len(publication_types) == 1 else 'unknown'
+    explicit_doi = _POLA_DOI.search(hasil['detail_doi'] or '')
     doi, konflik = _ekstrak_doi(hasil["detail_link"], hasil["detail_pdf_link"])
-    hasil["detail_doi"] = doi
-    if konflik is not None:
+    hasil["detail_doi"] = explicit_doi.group(0) if explicit_doi else doi
+    if konflik is not None and not explicit_doi:
         # DOI berbeda di dua URL -> simpan NULL (jangan pilih diam-diam),
         # catat kedua URL sumber dan kedua DOI hasil parsing untuk
         # pemeriksaan manual. Ikut pola print/log proyek (tanpa kolom DB).
@@ -869,12 +1015,14 @@ async def _ambil_detail_publikasi(page, all_rows, verbose=False):
     Mutasi `all_rows` di tempat. Mengembalikan status yang diproses di
     DALAM fungsi:
 
-        (partial_baru, error_message_baru, blocked_baru, failures_baru)
+        (partial_baru, error_message_baru, blocked_baru, failures_baru,
+         rate_limited_baru)
 
     Pemanggil (`scrape_scholar`) menggabungkannya dengan semantik
     PERTAHANAN: `partial = partial or ...`, `error_message = error_message
     or ...` (first-error-wins tetap berlaku, pesan lama tidak pernah
-    ditimpa), `blocked = blocked or ...`, `failures.extend(...)`.
+    ditimpa), `blocked = blocked or ...`, `rate_limited = rate_limited
+    or ...`, `failures.extend(...)`.
 
     INVARIAN STRUKTUR: sebelum loop per-row, SEMUA row di `all_rows`
     di-pre-fill dengan `_detail_kosong()` -> setiap row yang keluar dari
@@ -893,7 +1041,11 @@ async def _ambil_detail_publikasi(page, all_rows, verbose=False):
         diproses, lalu loop DIHENTIKAN (break) tanpa retry otomatis -
         permintaan detail berikutnya tidak dikirim; `blocked` tetap
         False (429 bukan captcha); row sesudahnya belum dicoba
-        (struktur None dari pre-fill).
+        (struktur None dari pre-fill). `rate_limited_baru` diset True:
+        lewat elemen kelima ini run diklasifikasi RATE_LIMITED (bukan
+        PARTIAL_SUCCESS) - sinyal first-class supaya pemanggil batch
+        menghentikan seluruh batch; baris yang sudah berhasil tetap
+        dipertahankan di envelope (hasil parsial tetap bisa disimpan).
       - detail_parse_error - parse_detail_html melempar.
       - detail_blocked - break karena block terdeteksi; entri hanya untuk
         row yang SEDANG diproses; row sesudahnya belum dicoba (struktur
@@ -901,14 +1053,17 @@ async def _ambil_detail_publikasi(page, all_rows, verbose=False):
         Pemicu: marker HTML captcha (detect_block) ATAU redirect URL ke
         halaman blokir Google (sorry-page, _url_blokir).
 
-    Urutan langkah per row dipertahankan: goto -> cek status -> tunggu
-    selector -> content -> deteksi block -> parse -> jitter. Print verbose
+    Urutan langkah per row dipertahankan: jitter -> goto -> cek
+    status -> tunggu selector -> content -> deteksi block -> parse
+    (tanpa jitter di akhir iterasi; jeda acak diberikan SEBELUM tiap
+    navigasi detail, termasuk request detail pertama). Print verbose
     mengikuti pola proyek (print, bukan logging).
     """
     partial_baru = False
     error_message_baru = None
     blocked_baru = False
     failures_baru = []
+    rate_limited_baru = False
 
     # Invarian struktur: semua row punya key detail_* (None) lebih dulu.
     for row in all_rows:
@@ -926,6 +1081,14 @@ async def _ambil_detail_publikasi(page, all_rows, verbose=False):
                 "detail_url": None,
             })
             continue
+        # jeda acak sebelum tiap navigasi detail supaya traffic tidak
+        # terbaca bot (termasuk request detail pertama).
+        await page.wait_for_timeout(
+            random.randint(
+                int(JITTER_DETAIL_MIN * 1000),
+                int(JITTER_DETAIL_MAX * 1000),
+            )
+        )
         try:
             resp = await page.goto(
                 detail_url, wait_until="domcontentloaded",
@@ -971,7 +1134,10 @@ async def _ambil_detail_publikasi(page, all_rows, verbose=False):
                 # kirim permintaan detail berikutnya, tanpa retry otomatis.
                 # Baris sesudah ini tidak dicoba; semua row tetap di
                 # all_rows dengan key detail None (pre-fill) dan metadata
-                # profil utuh -> pemanggil tetap menghasilkan PARTIAL_SUCCESS.
+                # profil utuh. rate_limited_baru=True -> run diklasifikasi
+                # RATE_LIMITED (bukan PARTIAL_SUCCESS): sinyal first-class
+                # supaya pemanggil batch menghentikan seluruh batch.
+                rate_limited_baru = True
                 print("    HTTP 429 — hentikan pengambilan detail.")
                 break
             continue
@@ -1056,7 +1222,7 @@ async def _ambil_detail_publikasi(page, all_rows, verbose=False):
             break
 
         try:
-            detail = parse_detail_html(html)
+            detail = parse_detail_html(html, base_url=detail_url)
         except Exception as exc:
             print(f"    detail {i + 1} parse gagal: {exc}")
             partial_baru = True
@@ -1075,15 +1241,8 @@ async def _ambil_detail_publikasi(page, all_rows, verbose=False):
         if verbose:
             print(f"    detail {i + 1}/{len(all_rows)}: OK")
 
-        # jeda acak antar detail supaya traffic tidak terbaca bot
-        await page.wait_for_timeout(
-            random.randint(
-                int(JITTER_DETAIL_MIN * 1000),
-                int(JITTER_DETAIL_MAX * 1000),
-            )
-        )
-
-    return partial_baru, error_message_baru, blocked_baru, failures_baru
+    return (partial_baru, error_message_baru, blocked_baru, failures_baru,
+            rate_limited_baru)
 
 
 # ============================================================
@@ -1091,7 +1250,8 @@ async def _ambil_detail_publikasi(page, all_rows, verbose=False):
 # ============================================================
 
 async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCHES,
-                         ambil_detail=True):
+                         ambil_detail=True,
+                         judul_sudah_tersimpan: "set | None" = None):
     """Scrape seluruh publikasi dari satu Google Scholar user ID.
 
     CATATAN PENTING SOAL PAGING
@@ -1119,7 +1279,9 @@ async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCH
     detail menghentikan fase itu tapi data daftar tetap disimpan ->
     PARTIAL_SUCCESS. HTTP 429 (rate limit) juga menghentikan fase itu
     tanpa retry - permintaan detail berikutnya tidak dikirim - dan data
-    daftar tetap disimpan -> PARTIAL_SUCCESS. Redirect ke halaman
+    yang sudah terkumpul tetap disimpan, TAPI statusnya RATE_LIMITED
+    (bukan PARTIAL_SUCCESS): 429 adalah sinyal first-class supaya
+    pemanggil batch menghentikan SELURUH batch. Redirect ke halaman
     blokir Google (sorry-page) juga menghentikan fase itu tanpa retry
     (reason detail_blocked), tanpa menyebut HTTP 429 karena status
     respons tidak diamati di jalur itu.
@@ -1130,9 +1292,40 @@ async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCH
     marker HTML (detect_block) ATAU redirect URL final ke /sorry/ pada
     host Google (_url_blokir). Sorry-page saat navigasi awal -> BLOCKED
     tanpa data; sorry-page saat paging -> PARTIAL_SUCCESS dengan data
-    batch sebelumnya dipertahankan. HTTP 429 yang benar-benar teramati
-    pada fase daftar tetap diperlakukan seperti sebelumnya (fatal
-    tanpa data -> TIMEOUT, pesan "HTTP 429 dari server" tidak diubah).
+    batch sebelumnya dipertahankan.
+
+    HTTP 429 = RATE_LIMITED (bukan TIMEOUT, bukan PARTIAL_SUCCESS):
+      - navigasi awal (goto profil) -> fatal tanpa data, pesan
+        "HTTP 429 dari server" dipertahankan;
+      - saat paging -> terdeteksi lewat listener event "response"
+        (klik tidak mengembalikan respons, jadi subrequest 429 adalah
+        satu-satunya sinyal); loop paging langsung berhenti, batch
+        terakhir TIDAK di-parse, data batch sebelumnya dipertahankan;
+      - fase detail -> loop detail berhenti tanpa retry (lihat atas).
+    Pada semua jalur: tanpa retry, tanpa ganti domain, tanpa bypass -
+    pemanggil batch wajib menghentikan seluruh batch.
+
+    MODE INCREMENTAL
+    ----------------
+    `judul_sudah_tersimpan` (opsional) berisi himpunan judul yang sudah
+    TERNORMALISASI lewat normalisasi_judul() - berasal dari pemanggil
+    (mis. judul publikasi yang sudah tersimpan di RAW PostgreSQL).
+    None (default) = scraping awal penuh, perilaku tidak berubah.
+
+    Bila diisi (mode incremental): fase daftar + paging tetap
+    menjelajah SEMUA halaman (deteksi blokir/sorry, dedupe
+    seen_titles, dan logika "paging tidak maju" tidak berubah), lalu
+    baris yang judulnya - setelah normalisasi, exact match, TANPA
+    fuzzy - sudah ada di himpunan itu dibuang SEBELUM fase detail,
+    sehingga publikasi lama tidak pernah dinavigasi ulang. Teks judul
+    asli di baris tidak pernah diubah (normalisasi hanya untuk
+    perbandingan). Envelope hanya berisi baris BARU: records_fetched
+    dan data.rows = baris baru saja. Profil punya publikasi tapi nol
+    yang baru -> SUCCESS (bukan NO_DATA); kegagalan detail pada baris
+    baru tetap menghasilkan status sesuai penyebabnya (HTTP 429 ->
+    RATE_LIMITED dengan baris baru dipertahankan; gagal lain ->
+    PARTIAL_SUCCESS), dan blokir/network error saat fase daftar tetap
+    diklasifikasi normal (BLOCKED/TIMEOUT).
 
     Return: run envelope 9 kunci berisi run_id, source, started_at,
     finished_at, status, records_fetched, records_failed,
@@ -1160,20 +1353,34 @@ async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCH
     parse_error = False
     expected_empty = False
     partial = False
+    # HTTP 429 teramati (navigasi awal / paging / detail) -> RATE_LIMITED
+    rate_limited = False
     error_message = None
     parsed_total = 0
+    # mode incremental: profil punya publikasi tapi semuanya sudah
+    # tersimpan (dihitung setelah filter, dibaca _envelope)
+    tanpa_publikasi_baru = False
 
     def _envelope():
         """Bangun run envelope dari state saat ini."""
         has_data = bool(all_rows)
-        status = _classify_status(
-            has_data=has_data,
-            blocked=blocked,
-            network_error=network_error,
-            parse_error=parse_error,
-            expected_empty=expected_empty,
-            partial=partial,
-        )
+        if (tanpa_publikasi_baru and not blocked and not network_error
+                and not parse_error and not rate_limited):
+            # Mode incremental: profil punya publikasi tapi semuanya sudah
+            # tersimpan di RAW -> bukan NO_DATA, ini pemeriksaan yang sukses
+            # tanpa publikasi baru. (rate_limited ikut dikecualikan supaya
+            # 429 selalu menang sebagai RATE_LIMITED.)
+            status = "SUCCESS"
+        else:
+            status = _classify_status(
+                has_data=has_data,
+                blocked=blocked,
+                network_error=network_error,
+                parse_error=parse_error,
+                expected_empty=expected_empty,
+                partial=partial,
+                rate_limited=rate_limited,
+            )
         data = _make_data(uid, name, h_index, all_rows, failures,
                           used_domain, batches,
                           time.perf_counter() - t_start) if has_data else None
@@ -1201,6 +1408,22 @@ async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCH
             )
             page = await context.new_page()
 
+            # Listener respons: deteksi 429 saat paging. Klik "Tampilkan
+            # lainnya" tidak mengembalikan objek respons, jadi satu-satunya
+            # sinyal 429 di fase paging adalah event "response" dari
+            # subrequest yang dipicu klik. Listener ini dikosultkan HANYA
+            # di loop paging; dua goto lain (profil & detail) memakai cek
+            # resp.status eksplisit. Daftar dibersihkan tepat sebelum tiap
+            # klik supaya 429 basi (subresource saat muat awal) tidak
+            # menghentikan klik berikutnya secara keliru.
+            respons_429 = []
+
+            def _catat_resp_429(resp):
+                if resp.status == 429:
+                    respons_429.append(resp.url)
+
+            page.on("response", _catat_resp_429)
+
             url = build_url(uid, start=0, domain=used_domain)
             if verbose:
                 print(f"  buka: {used_domain}")
@@ -1220,6 +1443,11 @@ async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCH
             if resp is not None and resp.status >= 400:
                 print(f"  HTTP {resp.status} dari server, hentikan.")
                 network_error = True
+                if resp.status == 429:
+                    # 429 = rate limit, bukan timeout biasa; status run
+                    # RATE_LIMITED dan pemanggil batch wajib menghentikan
+                    # seluruh batch (tanpa retry / ganti domain).
+                    rate_limited = True
                 error_message = f"HTTP {resp.status} dari server"
                 await browser.close()
                 return _envelope()
@@ -1316,7 +1544,17 @@ async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCH
                         print("    tombol nonaktif, semua publikasi sudah termuat.")
                     break
 
+                # jeda acak sebelum klik supaya traffic tidak terbaca bot
+                # (hanya saat klik benar-benar akan dilakukan: cek
+                # visible/disabled di atas sudah lolos).
+                await page.wait_for_timeout(
+                    random.randint(int(JITTER_MIN * 1000), int(JITTER_MAX * 1000))
+                )
+
                 before = len(all_rows)
+                # bersihkan catatan 429 basi: hanya respons yang datang
+                # SELAMA klik ini yang boleh menghentikan paging.
+                respons_429.clear()
                 try:
                     await more.click()
                 except Exception as exc:
@@ -1325,12 +1563,18 @@ async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCH
                     error_message = error_message or f"klik gagal: {exc}"
                     break
 
-                # jeda acak supaya traffic tidak terbaca bot
-                await page.wait_for_timeout(
-                    random.randint(int(JITTER_MIN * 1000), int(JITTER_MAX * 1000))
-                )
-
                 html = await page.content()
+                if respons_429:
+                    # 429 teramati pada subrequest paging: hentikan
+                    # pengambilan daftar. Batch ini TIDAK di-parse, tidak
+                    # ada klik lanjutan, dan fase detail tidak dijalankan
+                    # (guard rate_limited di bawah); data batch
+                    # sebelumnya tetap di all_rows.
+                    print("  HTTP 429 terdeteksi saat paging — hentikan pengambilan daftar.")
+                    rate_limited = True
+                    partial = True
+                    error_message = error_message or "HTTP 429 saat paging — pengambilan daftar dihentikan"
+                    break
                 kaptcha = detect_block(html)
                 if kaptcha or _url_blokir(page.url):
                     print("  DIBLOKIR Google setelah beberapa batch.")
@@ -1398,23 +1642,48 @@ async def scrape_scholar(uid, headless=True, verbose=True, max_batches=MAX_BATCH
                 if url and not url.startswith("http"):
                     r["detail_url"] = f"https://{used_domain}{url}"
 
+            # ---------- filter incremental (mode lanjutan) ----------
+            # judul_sudah_tersimpan = himpunan judul TERNORMALISASI
+            # (normalisasi_judul) milik pemanggil (mis. yang sudah
+            # tersimpan di RAW). Fase daftar + paging di atas tetap
+            # menjelajah SEMUA halaman; filter ini hanya memotong baris
+            # lama SEBELUM fase detail supaya publikasi lama tidak
+            # pernah dinavigasi ulang. Exact match setelah normalisasi,
+            # tanpa fuzzy; teks judul asli di baris tidak diubah.
+            incremental = judul_sudah_tersimpan is not None
+            tanpa_publikasi_baru = False
+            if judul_sudah_tersimpan is not None:
+                terlihat = len(all_rows)
+                all_rows = [
+                    r for r in all_rows
+                    if normalisasi_judul(r.get("title") or "") not in judul_sudah_tersimpan
+                ]
+                tanpa_publikasi_baru = incremental and terlihat > 0 and not all_rows
+                if verbose:
+                    print(f"  incremental: {terlihat} publikasi terlihat, "
+                          f"{len(all_rows)} baru")
+
             # ---------- fase halaman detail per publikasi ----------
             # Default ON. Kegagalan per-publikasi dicatat ke failures
             # (data daftar tetap dipakai) -> PARTIAL_SUCCESS. Block
             # menghentikan fase ini tapi data daftar tetap disimpan.
+            # rate_limited (429) juga menghentikan fase ini: setelah
+            # rate limit tidak ada permintaan lagi yang dikirim.
             # Badan fase diekstrak ke _ambil_detail_publikasi() supaya
             # bisa diuji tanpa browser; statusnya digabung di sini dengan
             # semantik PERTAHANAN (nilai lama tidak pernah ditimpa).
-            if ambil_detail and all_rows and not blocked:
+            if ambil_detail and all_rows and not blocked and not rate_limited:
                 if verbose:
                     print(f"  ambil halaman detail: {len(all_rows)} publikasi")
                 (hasil_partial, hasil_error,
-                 hasil_blocked, hasil_failures) = await _ambil_detail_publikasi(
+                 hasil_blocked, hasil_failures,
+                 hasil_rate_limited) = await _ambil_detail_publikasi(
                     page, all_rows, verbose=verbose,
                 )
                 partial = partial or hasil_partial
                 error_message = error_message or hasil_error
                 blocked = blocked or hasil_blocked
+                rate_limited = rate_limited or hasil_rate_limited
                 failures.extend(hasil_failures)
 
             # profil termuat tapi memang tidak punya publikasi

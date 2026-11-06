@@ -109,7 +109,7 @@ Untuk ID yang diawali tanda minus, gunakan bentuk `--id=ID_PROFIL_ANDA` agar arg
 
 ### 4.2 Workbook dosen
 
-Contoh lokasi lokal adalah `data dosen/Data dosen.xlsx`. Folder ini diabaikan Git. Tabel berikut hanya menggambarkan struktur, bukan data dosen nyata:
+Contoh lokasi lokal adalah `data/dosen/Data dosen.xlsx`. Folder ini diabaikan Git. Tabel berikut hanya menggambarkan struktur, bukan data dosen nyata:
 
 | no | nama | scholar_id | prodi |
 |---|---|---|---|
@@ -149,7 +149,7 @@ Default-nya headless, mengambil detail jika memungkinkan, lalu berhenti setelah 
 ```sh
 python -m src.pipeline.run_pipeline --id SCHOLAR_ID_ANDA --headed --batch 5 --tampil 10
 python -m src.pipeline.run_pipeline --id SCHOLAR_ID_ANDA --tanpa-detail
-python -m src.pipeline.run_pipeline --id SCHOLAR_ID_ANDA --referensi-dosen "data dosen/Data dosen.xlsx" --raw-only
+python -m src.pipeline.run_pipeline --id SCHOLAR_ID_ANDA --referensi-dosen "data/dosen/Data dosen.xlsx" --raw-only
 ```
 
 `--headed` menampilkan browser untuk pengamatan, bukan menjamin lolos pembatasan. `--tanpa-detail` mengurangi permintaan detail tetapi dapat mengurangi kelengkapan metadata/nama; ini bukan cara melengkapi data yang hilang.
@@ -162,7 +162,7 @@ python -m src.pipeline.run_pipeline --id SCHOLAR_ID_ANDA --referensi-dosen "data
 | `--batch` | Batas putaran daftar; default 60. Lihat penjelasan penghitungan di bawah. |
 | `--tampil` | Baris tabel terminal; default 20, nilai 0 tidak mencetak tabel. Tidak membatasi data yang disimpan. |
 | `--diam` | Mengurangi progress scraper; ringkasan dan pesan tertentu tetap dicetak. |
-| `--referensi-dosen` | Excel referensi identitas; default `data dosen/Data dosen.xlsx`. |
+| `--referensi-dosen` | Excel referensi identitas; default `data/dosen/Data dosen.xlsx`. |
 | `--raw-only` | Menegaskan mode default RAW. |
 | `--load-core` | Mengaktifkan pemrosesan lanjutan; jangan dipakai dalam alur utama ini. |
 | `--url`, `--echo-sql` | Ada pada CLI; batasan dan risiko dijelaskan pada bagian 3.3. |
@@ -175,20 +175,20 @@ python -m src.pipeline.run_pipeline --id SCHOLAR_ID_ANDA --referensi-dosen "data
 ### 6.1 Perintah utama
 
 ```sh
-python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut
+python src/pipeline/run_batch.py --file "data/dosen/Data dosen.xlsx" --lanjut
 ```
 
 Bentuk modul juga tersedia:
 
 ```sh
-python -m src.pipeline.run_batch --file "data dosen/Data dosen.xlsx" --lanjut
+python -m src.pipeline.run_batch --file "data/dosen/Data dosen.xlsx" --lanjut
 ```
 
 Batch memanggil runner satu profil secara berurutan, bukan paralel. File `--file` otomatis menjadi referensi identitas setiap profil. Contoh pengaturan tambahan:
 
 ```sh
-python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut --jeda 15 --batch 5 --tampil 0
-python src/pipeline/run_batch.py --file "data dosen/Data dosen.xlsx" --lanjut --mulai 10 --progress "data dosen/progress_batch.csv"
+python src/pipeline/run_batch.py --file "data/dosen/Data dosen.xlsx" --lanjut --jeda 15 --batch 5 --tampil 0
+python src/pipeline/run_batch.py --file "data/dosen/Data dosen.xlsx" --lanjut --mulai 10 --progress "data dosen/progress_batch.csv"
 ```
 
 Nilai jeda pada contoh bukan jaminan akses diterima. Selalu berhenti bila layanan membatasi akses.

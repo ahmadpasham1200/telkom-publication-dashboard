@@ -205,6 +205,8 @@ __all__ = [
     "write_raw_scrape_result",
     "load_core_rows",
     "load_scholar_run",
+    "baca_judul_tersimpan",
+    "ids_riwayat_lengkap",
 ]
 
 
@@ -241,7 +243,12 @@ STATUS_RAW_ONLY = "RAW_ONLY"
 # Dipakai di mode raw-only untuk membedakan "raw tersimpan" dari
 # "scraping sukses": kalau status scraper masuk himpunan ini,
 # statistik mengembalikan status scraper ASLI, bukan RAW_ONLY.
-STATUS_SCRAPER_FATAL = frozenset({"BLOCKED", "TIMEOUT", "NO_DATA", "PARSING_ERROR"})
+# RATE_LIMITED (HTTP 429) termasuk: raw tetap tersimpan (termasuk
+# data parsial bila 429 terjadi di fase detail), tapi scraping
+# tidak dianggap sukses dan pemanggil batch wajib berhenti.
+STATUS_SCRAPER_FATAL = frozenset({
+    "BLOCKED", "TIMEOUT", "NO_DATA", "PARSING_ERROR", "RATE_LIMITED",
+})
 
 
 # ============================================================
@@ -513,6 +520,14 @@ RAW_SCHOLAR_PUBLICATION = sa.Table(
     sa.Column("detail_link", sa.Text),
     sa.Column("detail_pdf_link", sa.Text),
     sa.Column("detail_doi", sa.Text),
+    sa.Column("detail_journal", sa.Text),
+    sa.Column("detail_conference", sa.Text),
+    sa.Column("detail_book", sa.Text),
+    sa.Column("detail_publication_type", sa.Text),
+    sa.Column("detail_extraction_status", sa.Text),
+    sa.Column("detail_cited_by", pg.JSONB(none_as_null=True)),
+    sa.Column("detail_related_articles", pg.JSONB(none_as_null=True)),
+    sa.Column("detail_all_versions", pg.JSONB(none_as_null=True)),
     # ---- Field bibliografi profil (ekstraksi parser profil P2 dari
     # teks venue/extra halaman daftar; TERPISAH dari detail_* yang
     # datang dari halaman detail) ----
@@ -1406,6 +1421,9 @@ KOLOM_RAW_PUBLICATION = (
     "detail_date", "detail_venue", "detail_volume", "detail_issue",
     "detail_pages", "detail_publisher", "detail_description",
     "detail_citations", "detail_link", "detail_pdf_link", "detail_doi",
+    "detail_journal", "detail_conference", "detail_book",
+    "detail_publication_type", "detail_extraction_status",
+    "detail_cited_by", "detail_related_articles", "detail_all_versions",
     "profile_volume", "profile_issue", "profile_pages", "status",
 )
 # Nama kolom RAW yang nilainya diambil dari key row BERBEDA (parser
@@ -3006,8 +3024,9 @@ def load_scholar_run(envelope, scholar_id, conn=None, raw_conn=None,
         Status yang dikembalikan: STATUS_RAW_ONLY untuk run yang
         scraping-nya sukses (SUCCESS / PARTIAL_SUCCESS / status tak
         dikenal / None), atau status scraper ASLI (BLOCKED / TIMEOUT
-        / NO_DATA / PARSING_ERROR) untuk run fatal - supaya pemanggil
-        bisa membedakan "raw tersimpan" dari "scraping sukses".
+        / NO_DATA / PARSING_ERROR / RATE_LIMITED) untuk run fatal -
+        supaya pemanggil bisa membedakan "raw tersimpan" dari
+        "scraping sukses".
     scholar_id : str, WAJIB
         Identitas profil yang sedang di-scrape, diambil dari
         pemanggil (argumen `--id` di CLI, atau author_id dari
@@ -3075,6 +3094,10 @@ def load_scholar_run(envelope, scholar_id, conn=None, raw_conn=None,
       status SKIPPED_NO_DATA dan `reason` yang menjelaskan
       kenapa - tapi baris raw-nya sudah tersimpan dan sudah
       ter-commit. Koneksi core tidak dibuka.
+    - RATE_LIMITED (HTTP 429) dengan data parsial: di mode
+      load-core, staging/core TIDAK diisi juga (diperlakukan
+      seperti run fatal lain); statistik mengembalikan status
+      RATE_LIMITED asli, bukan SKIPPED_NO_DATA.
     - `data` ada: `finished_at` diteruskan sebagai retrieved_at ke
       kedua tabel metrics, lalu seluruhnya masuk core dalam satu
       transaksi (lihat load_core_rows).
@@ -3230,6 +3253,35 @@ def load_scholar_run(envelope, scholar_id, conn=None, raw_conn=None,
         statistik.update(statistik_author)
         return statistik
 
+    # Run fatal yang tetap membawa data. Satu-satunya status yang
+    # mungkin sampai sini adalah RATE_LIMITED: HTTP 429 di fase
+    # detail menyimpan baris yang sudah sempat diambil di envelope.
+    # Raw SUDAH ter-commit di tahap 1; staging/core TIDAK diisi -
+    # diperlakukan seperti run fatal lain. Statistik mengembalikan
+    # status scraper ASLI (bukan SKIPPED) supaya pemanggil bisa
+    # membedakannya; run_pipeline memetakan RATE_LIMITED -> exit 3.
+    if (envelope or {}).get("status") in STATUS_SCRAPER_FATAL:
+        statistik = _stats_kosong()
+        statistik["run_id"] = run_id
+        statistik["raw_result_id"] = raw_result_id
+        statistik["status"] = envelope.get("status")
+        statistik["reason"] = (
+            "Run fatal dengan data parsial (status={}, pesan={}). "
+            "Envelope beserta {} baris parsial sudah tersimpan di "
+            "raw.scholar_scrape_result (result_id={}), sudah di-commit, "
+            "tetapi scraping TIDAK sukses sehingga transformasi dan "
+            "loading ke staging/core TIDAK dijalankan."
+            .format(
+                envelope.get("status") or "(tidak ada)",
+                envelope.get("error_message") or "(tidak ada)",
+                len((data or {}).get("rows") or []),
+                raw_result_id if raw_result_id is not None
+                else "(tidak ada)",
+            )
+        )
+        statistik.update(statistik_author)
+        return statistik
+
     core = to_core_rows(data, retrieved_at=envelope.get("finished_at"))
     # Profil untuk staging: hanya kalau tahap raw mengembalikan
     # result_id (kunci UNIQUE staging). Kalau tidak, staging dilewati
@@ -3254,3 +3306,63 @@ def load_scholar_run(envelope, scholar_id, conn=None, raw_conn=None,
     # tetap utuh.
     statistik.update(statistik_author)
     return statistik
+
+
+# ============================================================
+# PEMBACA RAW (read-only) UNTUK BATCH INCREMENTAL
+# ============================================================
+#
+# Dua fungsi baca-saja di atas raw.scholar_scrape_result. Dipakai
+# run_batch untuk jalur incremental (dosen berstatus `sudah` di
+# roster): mencari judul yang sudah tersimpan supaya scraper bisa
+# melewatinya, dan mencari dosen yang riwayat scraping-nya sudah
+# pernah lengkap. Keduanya TIDAK PERNAH menulis ke database.
+
+def baca_judul_tersimpan(scholar_id, url=None) -> list:
+    """Judul publikasi yang sudah tersimpan di RAW untuk satu scholar_id.
+
+    Mengumpulkan judul dari SEMUA run RAW milik scholar_id itu
+    (tabel append-only, union lintas run). Hanya membaca; tidak
+    pernah menulis/mengubah RAW. Melempar exception bila DB tidak
+    bisa diakses - pemanggil yang memutuskan fallback.
+
+    Nilai balik: list judul APA ADANYA (belum dinormalisasi; urutan
+    mengikuti hasil query). Judul None/kosong disaring di Python.
+    """
+    sql = sa.text(
+        "SELECT DISTINCT jsonb_array_elements(raw_envelope->'data'->'rows')"
+        "       ->>'title' AS judul "
+        "FROM raw.scholar_scrape_result "
+        "WHERE scholar_id = :sid"
+    )
+    conn = connect(url=url)
+    try:
+        judul_mentah = [row[0] for row in conn.execute(sql, {"sid": scholar_id})]
+    finally:
+        conn.close()
+    return [j for j in judul_mentah
+            if j is not None and str(j).strip() != ""]
+
+
+def ids_riwayat_lengkap(scholar_ids, url=None) -> set:
+    """scholar_id yang punya minimal satu run RAW berstatus SUCCESS.
+
+    Dipakai untuk inisialisasi kolom status roster: dosen dengan
+    riwayat scraping lengkap dianggap sudah pernah di-scrape penuh.
+    Melempar exception bila DB tidak bisa diakses.
+
+    Daftar kosong -> set() TANPA menyentuh database sama sekali.
+    """
+    if not scholar_ids:
+        return set()
+    sql = sa.text(
+        "SELECT DISTINCT scholar_id "
+        "FROM raw.scholar_scrape_result "
+        "WHERE status = 'SUCCESS' AND scholar_id IN :ids"
+    ).bindparams(sa.bindparam("ids", expanding=True))
+
+    conn = connect(url=url)
+    try:
+        return {row[0] for row in conn.execute(sql, {"ids": list(scholar_ids)})}
+    finally:
+        conn.close()

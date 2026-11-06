@@ -18,13 +18,24 @@ Alur
 
 Kenapa run yang GAGAL tetap diteruskan ke loader
 -------------------------------------------------
-Run fatal (BLOCKED / TIMEOUT / NO_DATA / PARSING_ERROR) tetap
-dikirim ke load_scholar_run. Itu disengaja: envelope-nya ditulis
-ke raw.scholar_scrape_result dan di-commit sebelum core disentuh,
-jadi "profil mana yang gagal dan kenapa" tetap tercatat. Kalau
-file ini berhenti di langkah 2 saat scraping gagal, tabel raw
-justru tidak akan pernah berisi record kegagalan - persis hal
-yang membuatnya berguna. Itu inti dari desain raw.
+Run fatal (BLOCKED / TIMEOUT / NO_DATA / PARSING_ERROR /
+RATE_LIMITED) tetap dikirim ke load_scholar_run. Itu disengaja:
+envelope-nya ditulis ke raw.scholar_scrape_result dan di-commit
+sebelum core disentuh, jadi "profil mana yang gagal dan kenapa"
+tetap tercatat. Kalau file ini berhenti di langkah 2 saat scraping
+gagal, tabel raw justru tidak akan pernah berisi record kegagalan -
+persis hal yang membuatnya berguna. Itu inti dari desain raw.
+
+Exit code
+---------
+    0   sukses (loaded / raw-only / skipped).
+    1   gagal load, atau status load tidak dikenali.
+    2   scraping gagal (BLOCKED / TIMEOUT / NO_DATA / PARSING_ERROR).
+    3   dihentikan rate limit (HTTP 429) - status RATE_LIMITED.
+        Envelope (termasuk data parsial bila ada) tetap tersimpan
+        di raw; tidak ada retry otomatis. Pemanggil batch wajib
+        menghentikan seluruh batch bila menerima kode ini.
+    130 dibatalkan pengguna (Ctrl+C).
 
 Cara menjalankan
 ----------------
@@ -81,7 +92,10 @@ from src.loading.postgres import (  # noqa: E402
 
 # Status run yang berarti scraping-nya tidak menghasilkan apa pun.
 # Ini BUKAN kegagalan pipeline: record-nya tetap disimpan di raw.
-STATUS_RUN_GAGAL = {"BLOCKED", "TIMEOUT", "NO_DATA", "PARSING_ERROR"}
+# RATE_LIMITED (HTTP 429) masuk di sini juga, TAPI exit code-nya
+# BERBEDA (3, bukan 2) - lihat cabang khusus di main() di bawah.
+STATUS_RUN_GAGAL = {"BLOCKED", "TIMEOUT", "NO_DATA", "PARSING_ERROR",
+                    "RATE_LIMITED"}
 
 
 def parse_args(argv=None):
@@ -98,6 +112,14 @@ def parse_args(argv=None):
             "raw.scholar_scrape_result; transformasi dan loading ke\n"
             "staging/core tidak dijalankan.\n"
             "--load-core: kebalikannya - lanjutkan ke staging/core.\n"
+            "\n"
+            "Exit code:\n"
+            "  0   sukses (loaded / raw-only / skipped)\n"
+            "  1   gagal load / status load tidak dikenali\n"
+            "  2   scraping gagal (BLOCKED/TIMEOUT/NO_DATA/PARSING_ERROR)\n"
+            "  3   dihentikan rate limit (HTTP 429); raw tetap tersimpan,\n"
+            "      tidak ada retry - batch wajib berhenti bila menerima 3\n"
+            "  130 dibatalkan pengguna (Ctrl+C)\n"
             "\n"
             "Status run:\n"
             "  SUCCESS         scraping selesai tanpa penanda partial.\n"
@@ -139,7 +161,7 @@ def parse_args(argv=None):
                    help="Kebalikan --raw-only: lanjutkan transformasi dan "
                         "loading ke staging/core (mode lama)")
     p.add_argument("--referensi-dosen",
-                   default="data dosen/Data dosen.xlsx",
+                   default="data/dosen/Data dosen.xlsx",
                    help="File Excel referensi identitas pemilik profil "
                         "(kolom `nama` + `scholar_id`; dibaca dengan "
                         "openpyxl). Bila file tidak ada atau tidak bisa "
@@ -351,6 +373,23 @@ def main(argv=None):
         print("  Transformasi/load  : tidak dijalankan (staging/core "
               "tidak disentuh).")
         return 0
+
+    if statistik.get("status") == "RATE_LIMITED":
+        # HTTP 429 dari Google Scholar. Berbeda dari fatal lain:
+        # exit code 3 adalah sinyal first-class ke batch runner supaya
+        # SELURUH batch berhenti (meneruskan 229 ke dosen berikutnya
+        # hanya akan menghasilkan 429 lagi). Raw tetap tersimpan -
+        # termasuk data parsial bila 429 terjadi di fase detail.
+        print()
+        print("  Baris masuk core   : TIDAK - run dihentikan rate limit.")
+        print("  Yang tersimpan     : envelope (termasuk data parsial "
+              "bila ada) di raw.scholar_scrape_result (result_id={}), "
+              "sudah di-commit.".format(statistik.get("raw_result_id")))
+        print("  Scraping           : dihentikan HTTP 429 (rate limit); "
+              "tidak ada retry otomatis.")
+        print("  Exit code          : 3 - jalankan lagi nanti untuk "
+              "melanjutkan.")
+        return 3
 
     if args.raw_only and statistik.get("status") in STATUS_RUN_GAGAL:
         print()

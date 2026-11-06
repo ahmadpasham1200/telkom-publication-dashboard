@@ -40,6 +40,7 @@ from src.ingestion.scrape_scholar_playwright import (  # noqa: E402
     _parse_h_index,
     _parse_tahun_daftar,
     detect_block,
+    normalisasi_judul,
     parse_detail_html,
     parse_profile_html,
 )
@@ -1075,7 +1076,7 @@ def test_fase_detail_invarian_key_setelah_block():
         # baris ke-3 sengaja tanpa paket: kalau dicoba, goto melempar
         # IndexError dan url-nya tercatat -> ketahuan.
     ])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     # row sukses: nilai detail nyata
     assert rows[0]["detail_title"] == "Judul Detail"
@@ -1096,7 +1097,7 @@ def test_fase_detail_url_kosong_tanpa_partial():
     """Row tanpa detail_url: entri baru + struktur None + partial False."""
     rows = [_baris_profil(None, "Tanpa URL")]
     page = FakePage([])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert partial is False          # kondisi data profil, bukan gagal proses
     assert blocked is False
@@ -1118,7 +1119,7 @@ def test_fase_detail_goto_gagal():
     """goto melempar -> detail_fetch_error + partial + pesan first-wins."""
     rows = [_baris_profil("https://scholar.example/1", "Gagal Buka")]
     page = FakePage([(RuntimeError("conn refused"), None, "")])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert partial is True
     assert blocked is False
@@ -1135,7 +1136,7 @@ def test_fase_detail_http_500():
     """HTTP >=400 -> detail_fetch_error dengan url tercatat."""
     rows = [_baris_profil("https://scholar.example/1", "HTTP 500")]
     page = FakePage([(500, None, "")])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert partial is True
     assert "detail HTTP 500" in pesan
@@ -1150,6 +1151,8 @@ def test_fase_detail_http_429_hentikan_loop():
     Baris sesudah 429 tidak boleh diminta (rate limit dihormati):
     FakePage tanpa paket tambahan akan melempar IndexError pada goto
     dan mencatat url-nya, jadi ketahuan kalau loop tetap lanjut.
+    Elemen kelima (rate_limited) wajib True: sinyal first-class untuk
+    pemanggil batch.
     """
     rows = [
         _baris_profil("https://scholar.example/1", "Kena 429"),
@@ -1157,7 +1160,7 @@ def test_fase_detail_http_429_hentikan_loop():
         _baris_profil("https://scholar.example/3", "BelumDicoba Juga"),
     ]
     page = FakePage([(429, None, "")])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, rate = _jalankan_fase_detail(page, rows)
 
     # loop BERHENTI: hanya baris pertama yang diminta
     assert page.goto_urls == ["https://scholar.example/1"]
@@ -1165,6 +1168,7 @@ def test_fase_detail_http_429_hentikan_loop():
     # kegagalan baris yang sedang diproses tetap dicatat
     assert partial is True
     assert blocked is False
+    assert rate is True
     assert pesan is not None
     assert "429" in pesan
     assert len(gagal) == 1
@@ -1196,7 +1200,7 @@ def test_fase_detail_http_500_lanjut_ke_baris_berikutnya():
         (500, None, ""),
         (None, None, _HTML_DETAIL_OK),
     ])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     # tetap lanjut: kedua baris diminta
     assert page.goto_urls == [
@@ -1210,21 +1214,23 @@ def test_fase_detail_http_500_lanjut_ke_baris_berikutnya():
     assert rows[1]["detail_title"] == "Judul Detail"
 
 
-def test_status_run_partial_success_setelah_429():
-    """Profil ada + fase detail berhenti karena 429 -> PARTIAL_SUCCESS.
+def test_status_run_rate_limited_setelah_429():
+    """Profil ada + fase detail berhenti karena 429 -> RATE_LIMITED.
 
     Menjalankan jalur 429 yang sebenarnya lalu menyusun status lewat
     _classify_status dengan semantik penggabungan persis seperti di
     scrape_scholar: `partial = partial or hasil_partial`,
-    `blocked = blocked or hasil_blocked` (kedua flag awal False karena
-    paging profil lancar).
+    `blocked = blocked or hasil_blocked`,
+    `rate_limited = rate_limited or hasil_rate_limited` (kedua flag awal
+    False karena paging profil lancar). rate_limited menang atas
+    partial -> bukan PARTIAL_SUCCESS lagi.
     """
     rows = [
         _baris_profil("https://scholar.example/1", "Kena 429"),
         _baris_profil("https://scholar.example/2", "BelumDicoba"),
     ]
     page = FakePage([(429, None, "")])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, rate = _jalankan_fase_detail(page, rows)
 
     status = _scrape_mod._classify_status(
         has_data=bool(rows),
@@ -1233,8 +1239,9 @@ def test_status_run_partial_success_setelah_429():
         parse_error=False,
         expected_empty=False,
         partial=False or partial,
+        rate_limited=False or rate,
     )
-    assert status == "PARTIAL_SUCCESS"
+    assert status == "RATE_LIMITED"
 
 
 def test_url_blokir_kasus_dasar():
@@ -1278,7 +1285,7 @@ def test_fase_detail_sorry_page_hentikan_loop():
         (None, None, "", url_sorry),
         # baris ke-3 sengaja tanpa paket: kalau dicoba, IndexError.
     ])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     # berhenti setelah baris ke-2: baris ke-3 tidak diminta
     assert page.goto_urls == [
@@ -1312,11 +1319,12 @@ def test_fase_detail_429_dahulukan_atas_sorry():
     url_sorry = "https://www.google.com/sorry/index?continue=x"
     rows = [_baris_profil("https://scholar.example/1", "Kena 429")]
     page = FakePage([(429, None, "", url_sorry)])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, rate = _jalankan_fase_detail(page, rows)
 
     # semantik 429 P29 dipertahankan persis
     assert page.goto_urls == ["https://scholar.example/1"]
     assert blocked is False  # 429 bukan captcha/blok klasik
+    assert rate is True      # 429 = sinyal RATE_LIMITED first-class
     assert partial is True
     assert pesan is not None
     assert "429" in pesan
@@ -1337,7 +1345,7 @@ def test_fase_detail_timeout_selector_url_sorry():
     rows = [_baris_profil("https://scholar.example/1", "Timeout Sorry")]
     timeout = TimeoutError("Timeout 20000ms exceeded")
     page = FakePage([(None, timeout, _HTML_DETAIL_OK, url_sorry)])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert blocked is True
     assert partial is True
@@ -1371,8 +1379,9 @@ _HTML_LISTING_BERSIH = (
 
 
 class _FakeRespList:
-    def __init__(self, status=200):
+    def __init__(self, status=200, url=None):
         self.status = status
+        self.url = url
 
 
 class _FakeMorePaging:
@@ -1433,6 +1442,13 @@ class _FakePageList:
         )
         self._more.page = self  # rangkai untuk url_setelah_klik
         self.timeouts = []
+        # handler event Playwright (page.on) - tes bisa memancarkan
+        # respons palsu lewat _emit_response(page, ...)
+        self._handlers = {}
+
+    def on(self, event, handler):
+        """Rekam handler event (meniru page.on Playwright)."""
+        self._handlers.setdefault(event, []).append(handler)
 
     async def goto(self, url, wait_until=None, timeout=None):
         self.goto_urls.append(url)
@@ -1514,6 +1530,52 @@ def test_classify_status_tanpa_data_blocked():
         has_data=False, blocked=True, network_error=False,
         parse_error=False, expected_empty=False, partial=False,
     ) == "BLOCKED"
+
+
+def test_classify_status_rate_limited_precedence_tertinggi():
+    """rate_limited=True menang atas SEMUA flag lain (first precedence).
+
+    Berlaku dengan data maupun tanpa data, dan mengalahkan
+    blocked/network_error/parse_error/partial sekaligus.
+    """
+    # tanpa data + semua flag buruk aktif -> tetap RATE_LIMITED
+    assert _scrape_mod._classify_status(
+        has_data=False, blocked=True, network_error=True,
+        parse_error=True, expected_empty=True, partial=True,
+        rate_limited=True,
+    ) == "RATE_LIMITED"
+    # dengan data + partial -> RATE_LIMITED, bukan PARTIAL_SUCCESS
+    assert _scrape_mod._classify_status(
+        has_data=True, blocked=False, network_error=False,
+        parse_error=False, expected_empty=False, partial=True,
+        rate_limited=True,
+    ) == "RATE_LIMITED"
+    # dengan data + blocked -> RATE_LIMITED, bukan PARTIAL_SUCCESS
+    assert _scrape_mod._classify_status(
+        has_data=True, blocked=True, network_error=False,
+        parse_error=False, expected_empty=False, partial=True,
+        rate_limited=True,
+    ) == "RATE_LIMITED"
+
+
+def test_classify_status_rate_limited_default_false_perilaku_lama():
+    """rate_limited default False -> klasifikasi lama tidak berubah."""
+    assert _scrape_mod._classify_status(
+        has_data=False, blocked=True, network_error=False,
+        parse_error=False, expected_empty=False, partial=False,
+    ) == "BLOCKED"
+    assert _scrape_mod._classify_status(
+        has_data=False, blocked=False, network_error=True,
+        parse_error=False, expected_empty=False, partial=False,
+    ) == "TIMEOUT"
+    assert _scrape_mod._classify_status(
+        has_data=True, blocked=False, network_error=False,
+        parse_error=False, expected_empty=False, partial=True,
+    ) == "PARTIAL_SUCCESS"
+    assert _scrape_mod._classify_status(
+        has_data=True, blocked=False, network_error=False,
+        parse_error=False, expected_empty=False, partial=False,
+    ) == "SUCCESS"
 
 
 def test_listing_sorry_url_awal_hasilkan_blocked(monkeypatch):
@@ -1598,31 +1660,114 @@ def test_listing_normal_tetap_success(monkeypatch):
     assert envelope["data"]["rows"][0]["title"] == "Judul Uji"
 
 
-def test_listing_http_429_teramati_perilaku_lama(monkeypatch):
-    """429 yang benar-benar teramati: perilaku lama dipertahankan.
+class _FakePagePagingUrutan(_FakePageList):
+    """_FakePageList + log peristiwa jitter terurut untuk uji paging."""
 
-    Fatal tanpa data -> TIMEOUT dengan pesan "HTTP 429 dari server";
-    pesan TIDAK diubah menjadi sorry-page.
+    def __init__(self, *, peristiwa=None, **kwargs):
+        super().__init__(**kwargs)
+        self.peristiwa = peristiwa if peristiwa is not None else []
+
+    async def wait_for_timeout(self, ms):
+        self.peristiwa.append(("jitter", ms))
+        await super().wait_for_timeout(ms)
+
+
+class _FakeMorePagingUrutan(_FakeMorePaging):
+    """_FakeMorePaging yang mencatat klik ke log halaman dan menjadi
+    nonaktif setelah klik pertama (supaya loop paging berhenti rapi)."""
+
+    async def click(self):
+        log = getattr(self.page, "peristiwa", None) if self.page else None
+        if log is not None:
+            log.append(("klik", None))
+        await super().click()
+        self._disabled = True
+
+
+def test_listing_jitter_paging_sebelum_klik(monkeypatch):
+    """Jitter paging terjadi SEBELUM more.click(), bukan setelahnya.
+
+    Cek visible/disabled lolos -> jitter -> klik. Tombol menjadi
+    nonaktif setelah klik pertama supaya loop berhenti tanpa klik
+    tambahan, sehingga log peristiwa persis [jitter, klik].
+    """
+    more = _FakeMorePagingUrutan(tampil=True)
+    # Judul batch 2 dibedakan supaya dedupe tidak menganggap paging
+    # tidak maju (judul sintetis default selalu "Judul Uji").
+    html_batch2 = _html_profil_sintetis("Venue Uji Dua").replace(
+        "Judul Uji", "Judul Kedua")
+    page = _FakePagePagingUrutan(
+        daftar_html=[
+            _html_profil_sintetis("Venue Uji"),
+            html_batch2,
+        ],
+        more=more,
+    )
+
+    envelope, _ = asyncio.run(_jalankan_listing(monkeypatch, page))
+
+    assert envelope["status"] == "SUCCESS"
+    assert more.klik_dipanggil == 1
+    # tepat satu jitter paging, tercatat SEBELUM klik
+    assert [jenis for jenis, _ in page.peristiwa] == ["jitter", "klik"]
+    ms = page.peristiwa[0][1]
+    assert (
+        _scrape_mod.JITTER_MIN * 1000 <= ms <= _scrape_mod.JITTER_MAX * 1000
+    )
+
+
+def test_listing_tanpa_klik_tanpa_jitter_paging(monkeypatch):
+    """Tombol tidak ada / nonaktif -> tidak ada jitter paging sama sekali
+    (jeda hanya saat klik benar-benar akan dilakukan)."""
+    page = _FakePageList(
+        daftar_html=[_html_profil_sintetis("Venue Normal")],
+        more=_FakeMorePaging(tampil=False),
+    )
+    envelope, _ = asyncio.run(_jalankan_listing(monkeypatch, page))
+
+    assert envelope["status"] == "SUCCESS"
+    assert page.timeouts == []
+
+
+def test_listing_http_429_status_rate_limited(monkeypatch):
+    """429 pada navigasi awal -> RATE_LIMITED (bukan TIMEOUT).
+
+    Fatal tanpa data; pesan "HTTP 429 dari server" dipertahankan dan
+    TIDAK diubah menjadi sorry-page. 429 = rate limit, bukan timeout
+    biasa: pemanggil batch wajib menghentikan seluruh batch.
     """
     page = _FakePageList(goto_status=429)
     envelope, _ = asyncio.run(_jalankan_listing(monkeypatch, page))
 
-    assert envelope["status"] == "TIMEOUT"
+    assert envelope["status"] == "RATE_LIMITED"
     msg = envelope["error_message"] or ""
     assert "429" in msg
+    assert "HTTP 429 dari server" in msg
     assert "sorry" not in msg.lower()
+    assert envelope["data"] is None
+    assert envelope["records_fetched"] == 0
+
+
+def test_listing_http_500_tetap_timeout(monkeypatch):
+    """Regresi: HTTP non-429 (mis. 500) pada navigasi awal tetap TIMEOUT."""
+    page = _FakePageList(goto_status=500)
+    envelope, _ = asyncio.run(_jalankan_listing(monkeypatch, page))
+
+    assert envelope["status"] == "TIMEOUT"
+    msg = envelope["error_message"] or ""
+    assert "HTTP 500 dari server" in msg
     assert envelope["data"] is None
 
 
 def test_fase_detail_parse_gagal(monkeypatch):
     """Parse exception -> detail_parse_error (dibedakan dari fetch)."""
-    def _melempar(_html):
+    def _melempar(_html, **_kwargs):
         raise ValueError("html rusak")
 
     monkeypatch.setattr(_scrape_mod, "parse_detail_html", _melempar)
     rows = [_baris_profil("https://scholar.example/1", "Parse Gagal")]
     page = FakePage([(None, None, "<html>normal</html>")])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert partial is True
     assert "detail parse gagal" in pesan
@@ -1644,7 +1789,7 @@ def test_fase_detail_block_entri_tunggal_dan_status():
         (None, None, _HTML_DETAIL_OK),
         (None, None, _HTML_BLOKIR),
     ])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert blocked is True
     assert partial is True
@@ -1669,7 +1814,7 @@ def test_fase_detail_block_saat_selector_timeout():
     page = FakePage([
         (None, TimeoutError("selector habis waktu"), _HTML_BLOKIR),
     ])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert blocked is True
     assert partial is True
@@ -1684,7 +1829,7 @@ def test_fase_detail_selector_timeout_non_block():
     """Timeout selector tanpa block -> detail_fetch_error, lanjut."""
     rows = [_baris_profil("https://scholar.example/1", "Timeout")]
     page = FakePage([(None, TimeoutError("selector habis"), "<html>oke</html>")])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert partial is True
     assert blocked is False
@@ -1704,7 +1849,7 @@ def test_fase_detail_sukses_penuh():
         (None, None, _HTML_DETAIL_OK),
         (None, None, _HTML_DETAIL_OK),
     ])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     assert gagal == []
     assert partial is False
@@ -1713,8 +1858,84 @@ def test_fase_detail_sukses_penuh():
     for baris in rows:
         assert baris["detail_title"] == "Judul Detail"
         assert baris["detail_venue"] == "Tech Journal"
-    # jitter wait dipanggil sekali per baris sukses
+    # jitter wait dipanggil sekali SEBELUM tiap goto (termasuk request
+    # pertama); tidak ada jitter lagi setelah row sukses diproses
     assert len(page.timeouts) == 2
+
+
+class _FakePageUrutan(FakePage):
+    """FakePage + log peristiwa terurut (jitter/goto) untuk uji urutan."""
+
+    def __init__(self, paket=()):
+        super().__init__(paket)
+        self.peristiwa = []
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        self.peristiwa.append(("goto", url))
+        return await super().goto(url, wait_until=wait_until, timeout=timeout)
+
+    async def wait_for_timeout(self, ms):
+        self.peristiwa.append(("jitter", ms))
+        await super().wait_for_timeout(ms)
+
+
+def test_fase_detail_jitter_sebelum_tiap_goto_termasuk_pertama():
+    """Jitter detail terjadi SEBELUM tiap page.goto (termasuk request
+    pertama) dan TIDAK ada jitter setelah row sukses diproses."""
+    rows = [
+        _baris_profil("https://scholar.example/1", "A"),
+        _baris_profil("https://scholar.example/2", "B"),
+    ]
+    page = _FakePageUrutan([
+        (None, None, _HTML_DETAIL_OK),
+        (None, None, _HTML_DETAIL_OK),
+    ])
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
+
+    assert gagal == []
+    assert partial is False
+    assert blocked is False
+    assert pesan is None
+
+    # urutan persis: jitter -> goto -> jitter -> goto (tanpa jitter
+    # di akhir iterasi sukses)
+    assert [jenis for jenis, _ in page.peristiwa] == [
+        "jitter", "goto", "jitter", "goto",
+    ]
+    assert [url for jenis, url in page.peristiwa if jenis == "goto"] == [
+        "https://scholar.example/1", "https://scholar.example/2",
+    ]
+    # peristiwa terakhir adalah goto, bukan jitter sisa
+    assert page.peristiwa[-1][0] == "goto"
+    # nilai jitter dalam rentang JITTER_DETAIL (20-30 detik -> ms)
+    for jenis, ms in page.peristiwa:
+        if jenis == "jitter":
+            assert (
+                _scrape_mod.JITTER_DETAIL_MIN * 1000
+                <= ms
+                <= _scrape_mod.JITTER_DETAIL_MAX * 1000
+            )
+
+
+def test_fase_detail_jitter_sebelum_goto_yang_gagal_juga():
+    """Jitter juga terjadi sebelum goto yang nanti gagal (jeda diberikan
+    sebelum navigasi, apa pun hasilnya)."""
+    rows = [_baris_profil("https://scholar.example/1", "Gagal Buka")]
+    page = _FakePageUrutan([(RuntimeError("conn refused"), None, "")])
+    _jalankan_fase_detail(page, rows)
+
+    assert [jenis for jenis, _ in page.peristiwa] == ["jitter", "goto"]
+    assert page.peristiwa[-1][0] == "goto"
+
+
+def test_fase_detail_tanpa_url_tanpa_jitter():
+    """Row tanpa detail_url tidak memicu jitter (tidak ada navigasi)."""
+    rows = [_baris_profil(None, "Tanpa URL")]
+    page = _FakePageUrutan([])
+    _jalankan_fase_detail(page, rows)
+
+    assert page.peristiwa == []
+    assert page.timeouts == []
 
 
 def test_fase_detail_profil_tidak_berubah():
@@ -1772,8 +1993,8 @@ _VALUE_SITASI = (
 
 
 def _semua_detail_none_kecuali(detail, kunci):
-    """Helper: semua DETAIL_KEYS None kecuali `kunci` (dan venue_label)."""
-    for k in DETAIL_KEYS:
+    """Field lama tetap None kecuali target; field tambahan diuji terpisah."""
+    for k in DETAIL_KEYS[:14]:
         if k in (kunci, "detail_venue_label"):
             continue
         assert detail[k] is None, f"{k} seharusnya None, dapat {detail[k]!r}"
@@ -1855,15 +2076,15 @@ def test_label_total_kutipan_dengan_tab():
 def test_label_tidak_dikenal_semua_none(label):
     """Label di luar LABEL_DETAIL -> semua field None (tanpa menebak)."""
     detail = parse_detail_html(_html_blok(_blok_label(label, "X")))
-    for k in DETAIL_KEYS:
+    for k in DETAIL_KEYS[:14]:
         assert detail[k] is None, f"{k} seharusnya None"
 
 
-@pytest.mark.parametrize("label", ["Book", "Series", "Number"])
+@pytest.mark.parametrize("label", ["Series", "Number"])
 def test_label_ditolak_semua_none(label):
-    """Book/Series/Number sengaja tidak dipetakan (lihat docstring)."""
+    """Series/Number tetap tidak dipetakan; Book kini didukung."""
     detail = parse_detail_html(_html_blok(_blok_label(label, "X")))
-    for k in DETAIL_KEYS:
+    for k in DETAIL_KEYS[:14]:
         assert detail[k] is None, f"{k} seharusnya None"
 
 
@@ -1910,7 +2131,7 @@ def test_deskripsi_dua_blok_fallback_pertama_menang():
 
 
 def test_venue_label_kategori_bilingual():
-    """Journal -> venue+label; Venue -> venue saja; Book/Series -> kosong."""
+    """Journal -> venue+label; Venue -> venue saja; Series -> kosong."""
     detail = parse_detail_html(_html_blok(_blok_label("Journal", "Tech Journal")))
     assert detail["detail_venue"] == "Tech Journal"
     assert detail["detail_venue_label"] == "Journal"
@@ -1919,7 +2140,7 @@ def test_venue_label_kategori_bilingual():
     assert detail["detail_venue"] == "Grand Ballroom"
     assert detail["detail_venue_label"] is None
 
-    for label in ("Book", "Series"):
+    for label in ("Series",):
         detail = parse_detail_html(_html_blok(_blok_label(label, "X")))
         assert detail["detail_venue"] is None
         assert detail["detail_venue_label"] is None
@@ -2018,7 +2239,7 @@ def test_fase_detail_sukses_mempertahankan_detail_doi():
         _baris_profil(None, "Tanpa URL"),
     ]
     page = FakePage([(None, None, _HTML_DETAIL_DOI_P10)])
-    partial, pesan, blocked, gagal = _jalankan_fase_detail(page, rows)
+    partial, pesan, blocked, gagal, *_ = _jalankan_fase_detail(page, rows)
 
     # row sukses: DOI terisi dari href title link, key P7 tetap
     assert rows[0]["detail_doi"] == "10.5555/p10.0001"
@@ -2144,3 +2365,432 @@ def test_ekstrak_doi_query_dan_path_beda_konflik():
         "detail_link_doi": "10.1000/abc",
         "detail_pdf_doi": "10.2222/bbbb",
     }
+
+
+# ============================================================
+# 18. normalisasi_judul (perbandingan judul incremental)
+# ============================================================
+
+def test_normalisasi_judul_case_insensitive():
+    """Huruf besar/kecil dianggap sama."""
+    assert normalisasi_judul("Deep Learning untuk RADAR") == \
+        normalisasi_judul("deep learning untuk radar")
+
+
+def test_normalisasi_judul_whitespace_dirapikan():
+    """Spasi ganda, tab, dan newline collapse jadi satu spasi."""
+    assert normalisasi_judul("Judul  dengan   spasi\tganda\nbaru") == \
+        normalisasi_judul("judul dengan spasi ganda baru")
+
+
+def test_normalisasi_judul_nbsp_diperlakukan_spasi():
+    """NBSP (\xa0) dianggap spasi biasa."""
+    assert normalisasi_judul("Judul\xa0Ber NBSP") == \
+        normalisasi_judul("judul ber nbsp")
+
+
+def test_normalisasi_judul_tanda_baca_diabaikan():
+    """Tanda baca diganti spasi: 'Judul: A, B!' == 'judul a b'."""
+    assert normalisasi_judul("Judul: A, B!") == "judul a b"
+    assert normalisasi_judul("Judul: A, B!") == normalisasi_judul("judul a b")
+
+
+def test_normalisasi_judul_tanpa_fuzzy_kata_beda_tetap_beda():
+    """TIDAK ada pencocokan fuzzy: kata berbeda -> hasil berbeda."""
+    assert normalisasi_judul("Machine Learning") != \
+        normalisasi_judul("Machine Learn")
+    assert normalisasi_judul("Machine Learning") == "machine learning"
+
+
+def test_normalisasi_judul_input_bukan_string():
+    """None / int / dll -> string kosong (bukan exception)."""
+    assert normalisasi_judul(None) == ""
+    assert normalisasi_judul(123) == ""
+    assert normalisasi_judul(["a"]) == ""
+
+
+# ============================================================
+# 19. Mode incremental scrape_scholar (judul_sudah_tersimpan)
+# ============================================================
+
+def _html_profil_multi(pasangan):
+    """Profil sintetis dengan BEBERAPA baris publikasi sekaligus.
+
+    `pasangan` = daftar (judul, nomor); tiap pasangan menjadi satu
+    baris dengan judul unik (untuk filter incremental) dan
+    citation_for_view unik (supaya URL detail tiap baris berbeda dan
+    bisa dilacak baris mana yang benar-benar dinavigasi).
+    """
+    baris = []
+    for judul, nomor in pasangan:
+        dok = (
+            _html_profil_sintetis("Venue Uji")
+            .replace("Judul Uji", judul)
+            .replace("UJI%3A1", "UJI%3A{}".format(nomor))
+        )
+        awal = dok.index("<tr")
+        akhir = dok.index("</tr>") + len("</tr>")
+        baris.append(dok[awal:akhir])
+    return (
+        "<html><body>"
+        '<div id="gsc_prf_in">Nama Uji</div>'
+        "<table>" + "".join(baris) + "</table>"
+        "</body></html>"
+    )
+
+
+class _FakeMoreDuaBatch(_FakeMorePaging):
+    """Tombol tampil & bisa diklik sekali; setelah klik menjadi nonaktif
+    (semua publikasi sudah termuat) supaya loop paging berhenti rapi."""
+
+    async def click(self):
+        await super().click()
+        self._disabled = True
+
+
+class _FakePageIncremental(_FakePageList):
+    """Halaman tiruan untuk mode incremental (fase daftar + detail).
+
+    Fase daftar memakai antrean `daftar_html` (warisan _FakePageList);
+    fase detail memakai antrean `paket_detail` - satu paket per goto
+    detail: (status_http, html). Pemisahan fase: panggilan goto PERTAMA
+    adalah navigasi profil (fase daftar selalu tepat satu goto);
+    panggilan goto berikutnya adalah navigasi detail. content() memakai
+    antrean daftar selama masih ada isinya, lalu beralih ke html detail
+    aktif (fase detail selalu dimulai setelah antrean daftar habis).
+    """
+
+    def __init__(self, *, paket_detail=(), **kwargs):
+        super().__init__(**kwargs)
+        self._paket_detail = [tuple(p) for p in paket_detail]
+        self.detail_urls = []
+        self.detail_status = []
+        self._goto_pertama = True
+        self._html_detail_aktif = ""
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        if self._goto_pertama:
+            self._goto_pertama = False
+            return await super().goto(
+                url, wait_until=wait_until, timeout=timeout)
+        # fase detail
+        self.detail_urls.append(url)
+        status, html = self._paket_detail.pop(0)  # kosong -> IndexError
+        self.detail_status.append(status)
+        self._html_detail_aktif = html
+        self.url = url
+        return _FakeRespList(status)
+
+    async def content(self):
+        if self._daftar_html:
+            return await super().content()
+        return self._html_detail_aktif
+
+
+async def _jalankan_scrape_incremental(monkeypatch, page,
+                                       judul_sudah_tersimpan=None):
+    """Jalankan scrape_scholar offline dengan fase detail aktif.
+
+    `judul_sudah_tersimpan` None = scraping awal penuh (perilaku lama);
+    himpunan judul ternormalisasi = mode incremental.
+    """
+    import playwright.async_api as _async_api
+
+    browser = _FakeBrowserList(page)
+    monkeypatch.setattr(
+        _async_api, "async_playwright", lambda: _FakePlaywrightList(browser),
+    )
+    envelope = await _scrape_mod.scrape_scholar(
+        "UJI", headless=True, verbose=False, ambil_detail=True,
+        judul_sudah_tersimpan=judul_sudah_tersimpan,
+    )
+    return envelope, browser
+
+
+def test_incremental_filter_sebelum_detail(monkeypatch):
+    """Judul lama dibuang SEBELUM fase detail; hanya baris baru dinavigasi.
+
+    Listing memuat A, B, C; himpunan tersimpan memuat A -> goto detail
+    tepat 2x (B, C), envelope hanya berisi B & C dengan judul ASLI
+    (bukan hasil normalisasi), status SUCCESS.
+    """
+    page = _FakePageIncremental(
+        daftar_html=[_html_profil_multi([
+            ("Judul A", 1), ("Judul B", 2), ("Judul C", 3),
+        ])],
+        paket_detail=[
+            (200, _HTML_DETAIL_OK),
+            (200, _HTML_DETAIL_OK),
+        ],
+    )
+    tersimpan = {normalisasi_judul("Judul A")}
+    envelope, _ = asyncio.run(
+        _jalankan_scrape_incremental(monkeypatch, page, tersimpan))
+
+    assert envelope["status"] == "SUCCESS"
+    # goto: 1 navigasi profil + 2 navigasi detail (B, C saja)
+    assert len(page.detail_urls) == 2
+    assert "UJI%3A2" in page.detail_urls[0]
+    assert "UJI%3A3" in page.detail_urls[1]
+
+    data = envelope["data"]
+    assert [r["title"] for r in data["rows"]] == ["Judul B", "Judul C"]
+    # judul asli dipertahankan (bukan hasil normalisasi lowercase)
+    assert data["rows"][0]["title"] == "Judul B"
+    assert data["rows"][0]["title"] != normalisasi_judul(
+        data["rows"][0]["title"])
+    assert envelope["records_fetched"] == 2
+
+
+def test_incremental_nol_baru_baru_status_success(monkeypatch):
+    """Semua judul sudah tersimpan -> tanpa goto detail, SUCCESS bukan
+    NO_DATA, records_fetched 0."""
+    page = _FakePageIncremental(
+        daftar_html=[_html_profil_multi([("Judul A", 1)])],
+        paket_detail=[],  # kosong: goto detail apa pun = IndexError
+    )
+    tersimpan = {normalisasi_judul("Judul A")}
+    envelope, _ = asyncio.run(
+        _jalankan_scrape_incremental(monkeypatch, page, tersimpan))
+
+    assert envelope["status"] == "SUCCESS"
+    assert envelope["status"] != "NO_DATA"
+    assert envelope["records_fetched"] == 0
+    # tidak ada navigasi detail sama sekali (hanya goto profil)
+    assert page.detail_urls == []
+    assert len(page.goto_urls) == 1
+    # tanpa baris baru -> data None (kontrak envelope tidak berubah)
+    assert envelope["data"] is None
+    assert envelope["records_failed"] == 0
+
+
+def test_incremental_mencakup_semua_halaman_paging(monkeypatch):
+    """Filter incremental berlaku lintas batch paging.
+
+    Batch 1 (sebelum klik): Judul Lama1, Judul Lama2. Batch 2 (hasil
+    klik 'Tampilkan lainnya'): Judul Baru1. Himpunan tersimpan memuat
+    kedua judul lama -> hanya Judul Baru1 yang dinavigasi detail;
+    membuktikan cek mencakup SEMUA halaman paging.
+    """
+    more = _FakeMoreDuaBatch(tampil=True)
+    page = _FakePageIncremental(
+        daftar_html=[
+            _html_profil_multi([("Judul Lama1", 1), ("Judul Lama2", 2)]),
+            _html_profil_multi([("Judul Baru1", 3)]),
+        ],
+        paket_detail=[(200, _HTML_DETAIL_OK)],
+        more=more,
+    )
+    tersimpan = {
+        normalisasi_judul("Judul Lama1"),
+        normalisasi_judul("Judul Lama2"),
+    }
+    envelope, _ = asyncio.run(
+        _jalankan_scrape_incremental(monkeypatch, page, tersimpan))
+
+    # paging benar-benar terjadi: satu klik 'Tampilkan lainnya'
+    assert more.klik_dipanggil == 1
+    assert envelope["status"] == "SUCCESS"
+    # hanya baris baru dari batch 2 yang dinavigasi detail
+    assert len(page.detail_urls) == 1
+    assert "UJI%3A3" in page.detail_urls[0]
+    data = envelope["data"]
+    assert [r["title"] for r in data["rows"]] == ["Judul Baru1"]
+    assert envelope["records_fetched"] == 1
+
+
+def test_incremental_http_429_rate_limited_dan_tanpa_retry(monkeypatch):
+    """HTTP 429 pada detail baris baru: gagal dicatat, loop berhenti,
+    tanpa retry, status RATE_LIMITED (bukan PARTIAL_SUCCESS) - baris
+    baru tetap dipertahankan di envelope (hasil parsial bisa disimpan)."""
+    page = _FakePageIncremental(
+        daftar_html=[_html_profil_multi([
+            ("Judul Baru1", 2), ("Judul Baru2", 3),
+        ])],
+        paket_detail=[(429, "")],  # satu paket: goto kedua = IndexError
+    )
+    tersimpan = {normalisasi_judul("Judul Lama")}
+    envelope, _ = asyncio.run(
+        _jalankan_scrape_incremental(monkeypatch, page, tersimpan))
+
+    assert envelope["status"] == "RATE_LIMITED"
+    assert envelope["status"] != "PARTIAL_SUCCESS"
+    # goto detail hanya 1x (baris pertama); tidak ada retry
+    assert len(page.detail_urls) == 1
+    assert page.detail_status == [429]
+
+    # kedua baris baru tetap di envelope (data daftar dipertahankan)
+    data = envelope["data"]
+    assert [r["title"] for r in data["rows"]] == ["Judul Baru1", "Judul Baru2"]
+    assert envelope["records_fetched"] == 2
+    assert envelope["records_failed"] == 1
+
+    gagal = data["failures"]
+    assert len(gagal) == 1
+    assert gagal[0]["reason"] == "detail_fetch_error"
+    assert gagal[0]["raw_title"] == "Judul Baru1"
+
+    # baris yang gagal & baris yang belum dicoba: key detail tetap None
+    for baris in data["rows"]:
+        assert set(DETAIL_KEYS) <= set(baris.keys())
+        assert all(baris[k] is None for k in DETAIL_KEYS)
+
+
+def test_incremental_http_500_tetap_partial(monkeypatch):
+    """Regresi: HTTP non-429 (mis. 500) pada detail baris baru tetap
+    PARTIAL_SUCCESS dan loop lanjut ke baris berikutnya."""
+    page = _FakePageIncremental(
+        daftar_html=[_html_profil_multi([
+            ("Judul Baru1", 2), ("Judul Baru2", 3),
+        ])],
+        paket_detail=[
+            (500, ""),
+            (200, _HTML_DETAIL_OK),
+        ],
+    )
+    tersimpan = {normalisasi_judul("Judul Lama")}
+    envelope, _ = asyncio.run(
+        _jalankan_scrape_incremental(monkeypatch, page, tersimpan))
+
+    assert envelope["status"] == "PARTIAL_SUCCESS"
+    # loop lanjut: kedua baris diminta
+    assert len(page.detail_urls) == 2
+    assert page.detail_status == [500, 200]
+    data = envelope["data"]
+    assert [r["title"] for r in data["rows"]] == ["Judul Baru1", "Judul Baru2"]
+    assert envelope["records_failed"] == 1
+    # baris kedua tetap berhasil diproses
+    assert data["rows"][1]["detail_title"] == "Judul Detail"
+
+
+def test_incremental_none_perilaku_lama_utuh(monkeypatch):
+    """Regresi: judul_sudah_tersimpan=None -> fase detail jalan untuk
+    SEMUA baris (perilaku scraping awal tidak berubah)."""
+    page = _FakePageIncremental(
+        daftar_html=[_html_profil_multi([
+            ("Judul A", 1), ("Judul B", 2),
+        ])],
+        paket_detail=[
+            (200, _HTML_DETAIL_OK),
+            (200, _HTML_DETAIL_OK),
+        ],
+    )
+    envelope, _ = asyncio.run(_jalankan_scrape_incremental(monkeypatch, page))
+
+    assert envelope["status"] == "SUCCESS"
+    # SEMUA baris dinavigasi detail (tanpa filter)
+    assert len(page.detail_urls) == 2
+    assert "UJI%3A1" in page.detail_urls[0]
+    assert "UJI%3A2" in page.detail_urls[1]
+    data = envelope["data"]
+    assert [r["title"] for r in data["rows"]] == ["Judul A", "Judul B"]
+    assert envelope["records_fetched"] == 2
+    # detail terisi pada semua baris
+    for baris in data["rows"]:
+        assert baris["detail_title"] == "Judul Detail"
+
+
+# ============================================================
+# 20. HTTP 429 saat paging (listener event "response")
+# ============================================================
+
+def _emit_response(page, status, url="https://scholar.google.co.id/x"):
+    """Pancarkan satu event 'response' palsu ke semua handler terdaftar.
+
+    Meniru respons subrequest yang dipicu klik 'Tampilkan lainnya':
+    klik tidak mengembalikan objek respons, jadi listener 429 di
+    scrape_scholar menerima objek lewat event ini.
+    """
+    resp = _FakeRespList(status, url)
+    for handler in page._handlers.get("response", []):
+        handler(resp)
+
+
+class _FakeMoreKlik429(_FakeMorePaging):
+    """Klik memicu satu respons 429 palsu (subrequest paging kena
+    rate limit) - meniru event 'response' yang diterima listener."""
+
+    async def click(self):
+        await super().click()
+        _emit_response(self.page, 429)
+
+
+class _FakePage429Basi(_FakePageIncremental):
+    """Emit satu respons 429 'basi' saat wait_for_selector awal (sebelum
+    klik apa pun) - meniru subresource yang kena 429 saat muat halaman."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._sudah_emit_basi = False
+
+    async def wait_for_selector(self, selector, timeout=None):
+        await super().wait_for_selector(selector, timeout=timeout)
+        if not self._sudah_emit_basi:
+            self._sudah_emit_basi = True
+            _emit_response(self, 429)
+
+
+def test_listing_429_saat_paging_rate_limited(monkeypatch):
+    """429 pada subrequest paging -> loop berhenti, RATE_LIMITED.
+
+    Klik pertama memicu respons 429: batch hasil klik TIDAK di-parse,
+    tidak ada klik kedua, fase detail TIDAK dijalankan (tanpa goto
+    detail), dan data batch 1 tetap di envelope.
+    """
+    more = _FakeMoreKlik429(tampil=True)
+    page = _FakePageIncremental(
+        daftar_html=[
+            _html_profil_sintetis("Venue Uji"),  # batch 1
+            _HTML_LISTING_BERSIH,                # content() setelah klik
+        ],
+        paket_detail=[],  # goto detail apa pun = IndexError (ketahuan)
+        more=more,
+    )
+    envelope, _ = asyncio.run(
+        _jalankan_scrape_incremental(monkeypatch, page))
+
+    assert envelope["status"] == "RATE_LIMITED"
+    # tepat satu klik: tidak ada klik lanjutan setelah 429
+    assert more.klik_dipanggil == 1
+    msg = envelope["error_message"] or ""
+    assert "429" in msg
+    assert "paging" in msg.lower()
+    # data batch 1 dipertahankan
+    assert envelope["records_fetched"] == 1
+    assert envelope["data"]["rows"][0]["title"] == "Judul Uji"
+    # fase detail tidak dijalankan: hanya goto profil
+    assert page.detail_urls == []
+    assert len(page.goto_urls) == 1
+
+
+def test_listing_429_basi_subresource_tidak_hentikan_klik(monkeypatch):
+    """429 subresource SEBELUM klik tidak menghentikan klik pertama.
+
+    Listener dibersihkan tepat sebelum tiap klik, jadi 429 basi dari
+    muat awal tidak boleh memicu penghentian keliru; paging normal
+    berjalan (satu klik, batch 2 ter-parse, detail kedua baris diambil,
+    SUCCESS).
+    """
+    more = _FakeMoreDuaBatch(tampil=True)
+    page = _FakePage429Basi(
+        daftar_html=[
+            _html_profil_multi([("Judul Satu", 1)]),
+            _html_profil_multi([("Judul Dua", 2)]),
+        ],
+        paket_detail=[
+            (200, _HTML_DETAIL_OK),
+            (200, _HTML_DETAIL_OK),
+        ],
+        more=more,
+    )
+    envelope, _ = asyncio.run(
+        _jalankan_scrape_incremental(monkeypatch, page))
+
+    assert envelope["status"] == "SUCCESS"
+    # klik pertama tetap terjadi meski ada 429 basi sebelum klik
+    assert more.klik_dipanggil == 1
+    # batch 2 ter-parse; kedua baris dinavigasi detail
+    assert len(page.detail_urls) == 2
+    data = envelope["data"]
+    assert [r["title"] for r in data["rows"]] == ["Judul Satu", "Judul Dua"]
+    assert envelope["records_fetched"] == 2
